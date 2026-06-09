@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NQ HVN Confluence Heatmap</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #080808;
+    --surface:  #111111;
+    --border:   #222222;
+    --accent:   #cc00ff;
+    --accent2:  #8800bb;
+    --text:     #cccccc;
+    --muted:    #555555;
+    --up:       #26a69a;
+    --down:     #ef5350;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 13px;
+    min-height: 100vh;
+  }
+
+  /* ── header ── */
+  header {
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  header .logo {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+  header .sub {
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  /* ── control bar ── */
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 16px;
+    padding: 20px 28px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .field label {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .field select,
+  .field input[type="time"],
+  .field input[type="number"] {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 10px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s;
+    appearance: none;
+    -webkit-appearance: none;
+  }
+  .field select:focus,
+  .field input:focus {
+    border-color: var(--accent2);
+  }
+  .field select { min-width: 130px; cursor: pointer; }
+  .field input[type="number"] { width: 72px; }
+  .field input[type="time"]   { width: 100px; }
+
+  /* custom select arrow */
+  .select-wrap { position: relative; }
+  .select-wrap::after {
+    content: "▾";
+    position: absolute;
+    right: 9px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    pointer-events: none;
+    font-size: 11px;
+  }
+
+  /* toggle group */
+  .toggle-group {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .toggle-group label.head {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .toggles {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .toggles label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 12px;
+    padding: 5px 9px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    transition: all 0.12s;
+    user-select: none;
+  }
+  .toggles input[type="checkbox"] { display: none; }
+  .toggles label:has(input:checked) {
+    border-color: var(--accent2);
+    color: var(--accent);
+    background: rgba(136,0,187,0.12);
+  }
+  .toggles label:hover { border-color: var(--muted); color: var(--text); }
+
+  /* generate button */
+  .btn-generate {
+    padding: 8px 22px;
+    background: var(--accent2);
+    border: none;
+    border-radius: 4px;
+    color: #fff;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    letter-spacing: 0.03em;
+    transition: background 0.15s;
+    white-space: nowrap;
+    align-self: flex-end;
+  }
+  .btn-generate:hover   { background: var(--accent); }
+  .btn-generate:active  { transform: scale(0.98); }
+  .btn-generate:disabled {
+    background: var(--border);
+    color: var(--muted);
+    cursor: not-allowed;
+  }
+
+  /* ── chart area ── */
+  .chart-wrap {
+    padding: 24px 28px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    min-height: 60vh;
+  }
+
+  /* spinner */
+  .spinner-wrap {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 60px 0;
+  }
+  .spinner-wrap.active { display: flex; }
+  .spinner {
+    width: 40px; height: 40px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner-label { color: var(--muted); font-size: 12px; }
+
+  /* error */
+  .error-box {
+    display: none;
+    background: rgba(239,83,80,0.1);
+    border: 1px solid #ef5350;
+    color: #ef5350;
+    padding: 12px 18px;
+    border-radius: 6px;
+    font-size: 12px;
+    max-width: 600px;
+    text-align: center;
+  }
+  .error-box.active { display: block; }
+
+  /* chart image */
+  #chart-img {
+    display: none;
+    max-width: 100%;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+  #chart-img.active { display: block; }
+
+  /* stats bar */
+  #stats-bar {
+    display: none;
+    width: 100%;
+    max-width: 1440px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  #stats-bar span b { color: var(--accent); }
+  #stats-bar.active { display: flex; }
+
+  /* placeholder */
+  .placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 80px 0;
+    color: var(--muted);
+  }
+  .placeholder .icon { font-size: 36px; opacity: 0.3; }
+  .placeholder p { font-size: 12px; }
+
+  /* footer */
+  footer {
+    padding: 14px 28px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 10px;
+    text-align: center;
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">NQ · HVN CONFLUENCE HEATMAP</div>
+    <div class="sub">volume profile · day+week+month stacking · predicted high/low from nearest_hvn model · {{ dates|length }} sessions loaded</div>
+  </div>
+</header>
+
+<form class="controls" id="ctrl-form" onsubmit="return generate(event)">
+
+  <div class="field">
+    <label>Date</label>
+    <div class="select-wrap">
+      <select name="date" id="sel-date">
+        {% for d in dates %}
+        <option value="{{ d }}" {% if d == default_date %}selected{% endif %}>
+          {{ d[:4] }}-{{ d[4:6] }}-{{ d[6:] }}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>Start (ET)</label>
+    <input type="time" name="start" value="09:30" step="60">
+  </div>
+
+  <div class="field">
+    <label>End (ET)</label>
+    <input type="time" name="end" value="16:00" step="60">
+  </div>
+
+  <div class="field">
+    <label>Lookback days</label>
+    <input type="number" name="lookback" value="15" min="2" max="56">
+  </div>
+
+  <div class="field">
+    <label>Session</label>
+    <div class="select-wrap">
+      <select name="session">
+        <option value="full" selected>full</option>
+        <option value="rth">rth</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>HVN pct</label>
+    <input type="number" name="hvn_pct" value="60" min="10" max="95" step="5">
+  </div>
+
+  <div class="field">
+    <label>Smooth</label>
+    <input type="number" name="smooth" value="5" min="1" max="21" step="2">
+  </div>
+
+  <div class="field">
+    <label>Pred high (blank = model)</label>
+    <input type="number" name="pred_high" step="0.25" placeholder="auto">
+  </div>
+
+  <div class="field">
+    <label>Pred low (blank = model)</label>
+    <input type="number" name="pred_low" step="0.25" placeholder="auto">
+  </div>
+
+  <button class="btn-generate" type="submit" id="btn-gen">Generate</button>
+
+</form>
+
+<div class="chart-wrap">
+
+  <div class="spinner-wrap" id="spinner">
+    <div class="spinner"></div>
+    <div class="spinner-label" id="spinner-label">Loading parquet files…</div>
+  </div>
+
+  <div class="error-box" id="error-box"></div>
+
+  <div id="stats-bar">
+    <span>Date <b id="s-date">—</b></span>
+    <span>Session <b id="s-session">—</b></span>
+    <span>Bars <b id="s-bars">—</b></span>
+    <span>Pred High <b id="s-phigh">—</b></span>
+    <span>Pred Low <b id="s-plow">—</b></span>
+    <span>Lookback <b id="s-lb">—</b></span>
+  </div>
+
+  <div class="placeholder" id="placeholder">
+    <div class="icon">▦</div>
+    <p>Select a date and press Generate</p>
+  </div>
+
+  <img id="chart-img" alt="LVN Heatmap Chart">
+
+</div>
+
+<footer>rpatel@baronfunds.com · NQ futures tick data Oct–Nov 2025</footer>
+
+<script>
+  async function generate(e) {
+    e.preventDefault();
+
+    const form    = document.getElementById('ctrl-form');
+    const btn     = document.getElementById('btn-gen');
+    const spinner = document.getElementById('spinner');
+    const errBox  = document.getElementById('error-box');
+    const img     = document.getElementById('chart-img');
+    const ph      = document.getElementById('placeholder');
+    const stats   = document.getElementById('stats-bar');
+    const spinLbl = document.getElementById('spinner-label');
+
+    // collect form values
+    const data = new FormData(form);
+    const params = new URLSearchParams();
+    params.set('date',     data.get('date'));
+    params.set('start',    data.get('start'));
+    params.set('end',      data.get('end'));
+    params.set('lookback', data.get('lookback'));
+    params.set('session',  data.get('session'));
+    params.set('hvn_pct',  data.get('hvn_pct'));
+    params.set('smooth',   data.get('smooth'));
+    if (data.get('pred_high')) params.set('pred_high', data.get('pred_high'));
+    if (data.get('pred_low'))  params.set('pred_low',  data.get('pred_low'));
+
+    // ui state: loading
+    btn.disabled = true;
+    img.classList.remove('active');
+    errBox.classList.remove('active');
+    stats.classList.remove('active');
+    ph.style.display  = 'none';
+    spinner.classList.add('active');
+    spinLbl.textContent = 'Loading tick data…';
+
+    // progress hint updates
+    const hints = [
+      'Loading cached profiles…',
+      'Stacking day+week+month…',
+      'Computing HVN confluence…',
+      'Looking up model predictions…',
+      'Rendering chart…',
+    ];
+    let hi = 0;
+    const hintTimer = setInterval(() => {
+      hi = (hi + 1) % hints.length;
+      spinLbl.textContent = hints[hi];
+    }, 3500);
+
+    try {
+      const res = await fetch('/chart?' + params.toString());
+      clearInterval(hintTimer);
+
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || `HTTP ${res.status}`);
+      }
+
+      const meta = res.headers.get('X-Chart-Meta');
+      if (meta) {
+        const m = JSON.parse(meta);
+        document.getElementById('s-date').textContent    = m.date;
+        document.getElementById('s-session').textContent = m.start + '–' + m.end + ' ET';
+        document.getElementById('s-bars').textContent    = m.bars;
+        document.getElementById('s-phigh').textContent   = m.pred_high != null ? m.pred_high.toFixed(2) : 'n/a';
+        document.getElementById('s-plow').textContent    = m.pred_low  != null ? m.pred_low.toFixed(2)  : 'n/a';
+        document.getElementById('s-lb').textContent      = m.lookback + 'd';
+        stats.classList.add('active');
+      }
+
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      img.src = url;
+      img.classList.add('active');
+
+    } catch(err) {
+      clearInterval(hintTimer);
+      errBox.textContent = 'Error: ' + err.message;
+      errBox.classList.add('active');
+      ph.style.display = 'flex';
+    } finally {
+      spinner.classList.remove('active');
+      btn.disabled = false;
+    }
+  }
+</script>
+</body>
+</html>

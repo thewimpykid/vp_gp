@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Environment and local tooling
+.env
+.env.*
+.claude/
+
+# Raw data and generated artifacts
+*.csv
+*.zip
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.db
+*.sqlite
+*.sqlite3
+cache/
+results/
+*.log
+*.log.err
+
+# Extracted vendor/data exports present in this workspace
+202510-20260609T000023Z-3-001/
+202510-20260609T000023Z-3-002/
+202511-20260609T001510Z-3-001/
+202511-20260609T001510Z-3-002/
+202511-20260609T001510Z-3-003/
