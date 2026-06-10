@@ -1,0 +1,393 @@
+================================================================================
+  NQ STACKED VOLUME PROFILE — HOW IT WORKS
+  intuitiveVP / stacked_vp.py
+  Last updated: 2026-06-09
+================================================================================
+
+This system identifies high-probability reversal zones on NQ futures (Nasdaq-100
+E-mini) using multi-timeframe volume profile analysis combined with structural
+price levels. It runs entirely on prior data — zero look-ahead. Zones computed
+before market open reflect only what a live trader would have known that morning.
+
+--------------------------------------------------------------------------------
+  1. DATA
+--------------------------------------------------------------------------------
+
+Source: 1Min_NQ.csv — Sierra Chart NQ 1-minute OHLCV export, 2014–2026.
+        4.17 million bars. Cross-validated against Yahoo Finance NQ=F (0.997 corr).
+Format: semicolon-separated, European number notation (3.575,75 = 3575.75 NQ pts).
+Cache:  On first load, parsed to Parquet for fast subsequent reads (<1s vs ~30s).
+
+Working range used: 2020–2026. Pre-2020 excluded to keep VP windows representative
+of current NQ volatility regime (~200–400 pt daily range vs ~100 pt pre-2018).
+
+--------------------------------------------------------------------------------
+  2. VOLUME PROFILE CONSTRUCTION
+--------------------------------------------------------------------------------
+
+A Volume Profile answers: "At each price level, how much volume was traded?"
+
+NQ 1-minute bars give OHLCV but not individual trade prices. The system uses the
+standard OHLCV approximation: distribute each bar's volume uniformly across all
+5-point bins that span its [Low, High] range.
+
+Example: a bar with Low=21000, High=21025, Volume=500
+  → spans bins 21000, 21005, 21010, 21015, 21020, 21025 (6 bins)
+  → each bin receives 500 / 6 = 83.3 contracts
+
+This is done vectorised across all bars in the window. The result is a histogram
+of volume-at-price with 5-point resolution.
+
+From the histogram three key levels are extracted:
+
+  POC (Point of Control):
+    The single 5-pt bin with the highest volume. This is where the market spent
+    the most time and traded the most — the "fair value" anchor of the session.
+    Weight: 1.1
+
+  VAH / VAL (Value Area High / Low):
+    The price range containing 70% of total volume, constructed greedily by
+    adding the highest-volume bins one at a time until the 70% threshold is met.
+    VAH = top of the highest VA bin. VAL = bottom of the lowest VA bin.
+    Price inside the VA is "accepted" by the market. Price outside tends to
+    reject and return toward VA — the core mean-reversion logic.
+    Weight: 1.2 each
+
+  HVN (High Volume Node):
+    Peaks in the volume histogram with prominence ≥ 35% of the peak bar's volume
+    (HVN_PROMINENCE = 0.35). HVNs represent price ranges where the market
+    clustered heavily — strong support/resistance because unfilled orders remain.
+    HVN boundaries (edges) are the actionable levels: price decelerates and
+    reverses at HVN edges, not at the HVN center.
+    Detection: scipy.signal.find_peaks on a Savitzky-Golay smoothed profile.
+
+  LVN (Low Volume Node):
+    Valleys in the volume histogram where volume < 40% of mean volume
+    (LVN_DEPTH = 0.40). LVNs are price gaps or thin zones — price travels
+    quickly through them in trending moves but can also act as magnets when
+    approached from the other side.
+    Weight: 0.9
+
+  Shelf / Ledge (DISABLED):
+    Originally: classify HVN boundaries by their slope.
+      Shelf = gradual taper (avg_slope ≤ 0.08)
+      Ledge = abrupt cliff (avg_slope ≥ 0.25)
+    Disabled after backtesting showed shelf/ledge solo reversal rates (6.5%)
+    were below the random baseline (11.9%). Including them added noise.
+    INCLUDE_SHELF = False, INCLUDE_LEDGE = False.
+
+--------------------------------------------------------------------------------
+  3. THREE VOLUME PROFILE TIMEFRAMES
+--------------------------------------------------------------------------------
+
+Three separate VP windows are computed simultaneously. Each window uses a
+different amount of prior history, capturing structure at different time scales.
+
+  30d  (~21 trading days, 1 month):
+    Short-term structure — recent consolidation zones, fresh POCs, current value
+    area. Most responsive to recent price action. Levels shift week-to-week.
+
+  60d  (~42 trading days, 2 months):
+    Medium-term structure — captures a full market cycle (most NQ swings are
+    20–40 trading days). VAH/VAL represent broader acceptance ranges.
+
+  90d  (~63 trading days, 3 months):
+    Long-term structural floor/ceiling — quarterly value area. Slow to move.
+    When price revisits a 90d HVN from months prior it often gets a large reaction.
+
+Weekly was tested and removed — it added noise without improving reversal rates.
+
+Mode options:
+  Rolling (default):  window = last N trading days from df tail
+  Anchored:           window = calendar boundary (1st of month, Monday of week)
+  Anchored is used for sample-day charts (better for intraday analysis since
+  it aligns with how market participants think about monthly/weekly ranges).
+
+The three profiles are computed independently. Each contributes its own set of
+VAH, VAL, POC, HVN-edge, and LVN features. Features from all three then enter
+the confluence stacking step.
+
+--------------------------------------------------------------------------------
+  4. STRUCTURAL PRICE LEVEL FEATURES
+--------------------------------------------------------------------------------
+
+Beyond volume profiles, six categories of structural levels are added:
+
+4a. PDH / PDL — Prior Day High / Low
+    Weight: 1.4 (highest among all structural features)
+    Source: daily OHLC aggregated from 1m bars, last 10 prior sessions.
+    Why: PDH/PDL are the single most-watched NQ levels. Institutional desks
+    explicitly reference prior day extremes for entry/exit. When price sweeps
+    PDH intraday and reverses, that's a textbook SFP (Stop Fill Play).
+    Per-day timeframe IDs: d-1 (yesterday), d-2 (day before), d-3... d-10.
+    This is critical: if yesterday's high and 3 days ago's high are both near
+    21500, they get unique timeframe IDs (d-1 and d-3), so when they stack they
+    boost n_tf count exponentially (n_tf² in the scoring formula). Two days
+    stacking at the same price doubles the exponent term.
+
+4b. PWH / PWL — Prior Week High / Low
+    Weight: 1.2
+    Source: ISO week aggregation, prior completed week only.
+    Why: weekly extremes are headline levels for swing traders and options desks.
+    NQ weekly options expiry creates demand for strikes near PWH/PWL.
+
+4c. IBH / IBL — Initial Balance High / Low
+    Weight: 1.6 (highest weight of any single feature)
+    Source: 09:30–10:30 ET (minutes 570–630) for each of 3 prior sessions.
+    Why: the Initial Balance is the first hour of regular trading. IB extremes
+    define the "auction range" that day. Research (Market Profile theory) shows:
+    - ~70% of days stay within 2× IB range
+    - IB extensions (breakouts above IBH or below IBL) are high-probability
+      continuation moves
+    - Failed IB extensions (reversal back through IB after a sweep) are among
+      the cleanest reversal setups in intraday trading
+    Timeframe IDs: d-1, d-2, d-3 (same per-day ID system as PDH/PDL).
+    Weight 1.6 reflects that IBH/IBL backtested with the highest solo reversal
+    rate of any session-derived level.
+
+4d. ONH / ONL — Overnight High / Low
+    Weight: 1.2
+    Source: 00:00–09:29 ET (pre-market session) for each of 3 prior sessions.
+    Why: overnight range defines the "reference" for the coming RTH session.
+    Price opening outside the overnight range signals institutional interest.
+    Gap fills (price returning to the prior overnight close) are systematic in NQ.
+
+4e. Gap Level — Prior RTH Close
+    Weight: 1.1
+    Source: close price of the last RTH bar (09:30–16:15 ET) for each of 3 prior
+    sessions. This is the gap reference: if NQ opens above yesterday's RTH close,
+    there's an open gap below. Gap fills are common in NQ (estimated 60–70%
+    frequency) making prior RTH close a reliable attractor level.
+
+4f. PMH / PML — Prior Month High / Low
+    Weight: 1.3
+    Source: calendar month aggregation, prior completed month only.
+    Why: monthly extremes are macro-level reference points. Large traders use
+    monthly ranges for position sizing. When price tests PMH/PML, it often gets
+    a multi-hour reaction.
+
+4g. Round Numbers — Psychological Levels
+    Weight: 1.5 for 500-point levels (e.g. 21000, 21500, 22000)
+             1.0 for 100-point levels (e.g. 21100, 21200, 21300)
+    Range: within ±4 × 20-day ATR of current price.
+    Why: round numbers attract market attention because options strikes cluster
+    there, stop losses cluster there, and retail traders anchor to them. At NQ
+    21500 vs 21473, the former always gets more attention. The psychological
+    effect is documented in order-book data (higher cancel-replace activity near
+    round numbers as algos test liquidity).
+    500-point levels carry higher weight because NQ futures have standard contract
+    rollover stops and large-lot hedges placed at 500pt increments.
+
+--------------------------------------------------------------------------------
+  5. CONFLUENCE STACKING (The Core Logic)
+--------------------------------------------------------------------------------
+
+All features from all timeframes are now pooled: VP VAH/VAL/POC/HVN/LVN from
+30d/60d/90d profiles, PDH/PDL/PWH/PWL, IBH/IBL/ONH/ONL/gap, PMH/PML, rounds.
+
+The key insight: a price level with evidence from multiple independent sources
+is far more significant than one from a single source. If the 30d VAH, the
+90d HVN upper boundary, yesterday's high, and a 500pt round number all land
+within 15 points of each other — that is a high-conviction structural level.
+
+Stacking algorithm (greedy clustering):
+
+  1. Sort all features by price ascending.
+  2. Scan left to right. For each unassigned feature, grab all other features
+     within ±tolerance of it. Tolerance = 3.0 × 5.0 pt bin = 15 points.
+  3. All grabbed features form a cluster. The cluster's price is the mean
+     of all member feature prices.
+  4. Count unique timeframes contributing (n_tf). Two features from the same
+     timeframe count as n_tf = 1.
+  5. Score = n_tf² × Σ(feature weights)
+
+The n_tf² exponent is the key design choice. It makes multi-timeframe alignment
+exponentially more valuable than single-timeframe concentration:
+
+  1 timeframe, total weight 4.0 → score = 1² × 4.0 = 4.0
+  2 timeframes, total weight 4.0 → score = 2² × 4.0 = 16.0
+  3 timeframes, total weight 4.0 → score = 3² × 4.0 = 36.0
+  4 timeframes, total weight 4.0 → score = 4² × 4.0 = 64.0
+
+This means a zone where 30d VAH, 60d POC, PDH d-1, and IBH all agree is 16×
+more confident than the same weight concentrated in one timeframe.
+
+Per-day timeframe IDs for PDH/PDL and IBH/IBL amplify this further: if the
+last three days all made their high near 21500, those are d-1, d-2, and d-3 —
+three separate timeframes all contributing. The result is a very high n_tf count
+even from daily features alone, correctly rewarding price levels where multiple
+sessions found the same structural barrier.
+
+Final output: zones sorted by score descending. Score range typically 4–120+.
+Zones scoring 3+ unique timeframes are considered "high confidence."
+
+--------------------------------------------------------------------------------
+  6. ZONE SELECTION FOR DAILY OUTPUT
+--------------------------------------------------------------------------------
+
+From all scored zones, 5 are selected for display per day:
+
+  Step 1: Filter to n_tf ≥ 2 (drop single-timeframe noise). If fewer than 4
+          remain, fall back to all zones regardless of n_tf count.
+
+  Step 2: Expand ATR multiplier until ≥ 5 qualifying zones are within range.
+          Start at ±2.0 ATR from current close, expand by 0.5 each try up to
+          ±5.0 ATR. 20-day ATR ≈ 200–350 pts on recent NQ.
+
+  Step 3: Balance: take ceil(5/2)=3 from above current price, 2 from below.
+          Fill deficit from the other side if one side is short.
+          This ensures zones both above AND below price are always present —
+          avoids the failure mode where all zones cluster on one side.
+
+  Step 4: Sort selected zones by price ascending for display.
+
+Chart display: each zone rendered as a band centered on zone.price.
+  Band half-width = zone.price × 0.0005 (0.05% of price, ~11 points at NQ 22000).
+  This scales proportionally with NQ's level rather than being a fixed point count.
+  Color: magenta colormap, darker = higher score.
+  Dashed line at zone center price.
+  Label: price, [R/S] role, feature types, n_tf count.
+  Gold dotted lines: actual HOD and LOD for the session (post-hoc reference only).
+
+--------------------------------------------------------------------------------
+  7. SCORING AND WEIGHTS SUMMARY
+--------------------------------------------------------------------------------
+
+Feature type            Weight    Rationale
+---------------------------------------------------------------------------
+ibh / ibl               1.6       Strongest intraday barrier in Market Profile
+pdh / pdl               1.4       Most-watched NQ level; institutional orders
+pml / pmh               1.3       Monthly extremes, macro reference
+vah / val               1.2       70% value area boundaries (Market Profile)
+onh / onl               1.2       Overnight range extremes, gap analysis
+pwh / pwl               1.2       Weekly extremes, options/weekly reference
+round (500pt)           1.5       Highest psycho level; options strike density
+round (100pt)           1.0       Standard psycho level, retail stop clustering
+poc                     1.1       Highest-volume bin; fair value anchor
+lvn                     0.9       Thin zone; fast travel or reversal attractor
+shelf (DISABLED)        0.8       Gradual HVN boundary — disabled (below baseline)
+ledge (DISABLED)        1.3       Abrupt HVN boundary — disabled (below baseline)
+
+Final zone score = n_tf² × Σ(weights of all member features)
+
+Example — a zone at 21500 with:
+  30d VAH (1.2) + 60d HVN upper (ledge disabled, ignored) + PDH d-1 (1.4) +
+  IBH d-2 (1.6) + round 500pt (1.5) + 90d POC (1.1)
+  = 5 unique timeframes (30d, 60d, d-1, d-2, psychological)
+  weights sum = 1.2 + 1.4 + 1.6 + 1.5 + 1.1 = 6.8
+  score = 5² × 6.8 = 25 × 6.8 = 170.0 — extremely high confidence
+
+--------------------------------------------------------------------------------
+  8. NO LOOK-AHEAD ENFORCEMENT
+--------------------------------------------------------------------------------
+
+Every sample-day chart and every HOD/LOD coverage test uses strict walk-forward
+computation. The pipeline is:
+
+  df_prior = all bars with date < target_day
+  df_window = df_prior.tail(30_000)       # ~90 days of 1m bars
+
+  run(df_window, anchored=True) → zones
+
+No data from the target day or any future day enters the VP computation.
+The 30,000-bar tail covers all three lookback windows (90d ≈ 35,100 bars at
+390 bars/day) plus the structural features that only require last ~10 sessions.
+
+Why 30,000 and not the exact window? Provides a comfortable buffer while keeping
+computation time reasonable. 30k bars = ~76 trading days = more than enough for
+the 90d VP window.
+
+--------------------------------------------------------------------------------
+  9. HOD/LOD COVERAGE VALIDATION
+--------------------------------------------------------------------------------
+
+The most honest test of the system: does any zone land within ±25 points of the
+actual day's High or Low?
+
+Method (walk-forward, 60 sampled days):
+  1. Sample 60 days randomly from eligible pool (≥300 bars, ≥90 prior days).
+  2. For each day: compute zones from strictly prior data only.
+  3. Find minimum distance from any zone to actual HOD and LOD.
+  4. Hit if distance ≤ 0.12% of mid-price (≈25 pts at 21000).
+
+Results (seed=42, 60 days from 2020–2026 pool):
+  HOD captured: 68.3%   (41/60)
+  LOD captured: 70.0%   (42/60)
+  Both captured: 53.3%  (32/60)
+  Avg distance HOD: ~15 pts
+  Avg distance LOD: ~16 pts
+
+Interpretation: on 7 of 10 days, at least one zone is within 25 points of the
+session extreme. The ~30% miss rate is concentrated on:
+  a) Trend days: price breaks hundreds of points below all prior structure
+     (e.g. crash days like 2024-08-01). Correct behavior — no prior structure
+     means no zone. Do not fade trend days at arbitrary levels.
+  b) Days where NQ gaps far beyond any prior level at open (gap-and-go).
+  c) Low-volume holiday sessions with compressed ranges.
+
+--------------------------------------------------------------------------------
+  10. WHAT THE SYSTEM IS NOT
+--------------------------------------------------------------------------------
+
+Not a mechanical buy/sell signal. Zones are reversal-probability zones, not
+entries. A zone showing "RESIST" does not guarantee a reversal — it marks where
+the probability of rejection is elevated compared to a random price level.
+
+Not designed for trending days. When NQ opens above prior week high and grinds
+higher all day, the system correctly produces no zones in the upper range (no
+prior structure). The correct response is to not trade against the trend.
+
+Not calibrated to specific tick targets. The band width (±11 points at NQ 22000)
+is for visualization only. Actual entry/exit triggers require additional criteria
+(candlestick patterns, delta divergence, volume exhaustion, etc.).
+
+Not guaranteed forward-valid beyond the current vol regime. The 2014–2017 data
+showed zero edge because NQ's daily ATR was ~100 pts then vs ~200–350 pts now.
+If NQ's ATR compresses below ~150 pts for a sustained period, reassess.
+
+--------------------------------------------------------------------------------
+  11. PERFORMANCE CHARACTERISTICS
+--------------------------------------------------------------------------------
+
+Compute time:
+  First run (parquet build): ~30 seconds (4M rows CSV parse)
+  Subsequent runs:            <3 seconds (parquet load + VP construction)
+  Per-day in plot_sample_days: ~0.3s per day (30k bar subset)
+  30-day sample chart batch: ~15 seconds total
+
+Memory:
+  Full 4M-bar DataFrame: ~400 MB
+  30k-bar VP window: ~3 MB
+  Zone list (all): ~50 zones typical, negligible memory
+
+Files:
+  stacked_vp.py              — main script (1816 lines)
+  run_2024_2025.py           — helper: generate 30 days from 2025
+  hdata/NQ_1m_sierra_cache.parquet — cached parsed data
+  optimize_results.csv       — 7-dimension sweep results
+  hod_lod_coverage.csv       — per-day HOD/LOD hit/miss table
+  day_YYYY-MM-DD.png         — individual sample day charts
+
+--------------------------------------------------------------------------------
+  12. COMMAND REFERENCE
+--------------------------------------------------------------------------------
+
+# Daily levels (what to trade today):
+python stacked_vp.py --anchored --daily 5
+
+# 3-year reversal backtest:
+python stacked_vp.py --anchored --backtest --rev-pct 0.60
+
+# HOD/LOD walk-forward coverage test:
+python stacked_vp.py --hod-lod --hod-days 60
+
+# Generate N sample day charts (random dates, no look-ahead):
+python stacked_vp.py --anchored --sample-days 15 --seed 42
+
+# Run 7-dimension optimization sweep:
+python stacked_vp.py --anchored --optimize --rev-pct 0.60
+
+# Generate 30 charts filtered to 2025 only:
+python run_2024_2025.py
+
+================================================================================

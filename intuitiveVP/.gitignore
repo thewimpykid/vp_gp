@@ -1,0 +1,7 @@
+hdata/
+__pycache__/
+*.pyc
+*.png
+backtest_*.csv
+gradient_sweep.csv
+.vscode/
