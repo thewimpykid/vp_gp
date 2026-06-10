@@ -54,7 +54,7 @@ SNAP_CENTER      = True   # zone center = heaviest member price (not cluster mea
 TOL_PCT          = 0.0012 # HOD/LOD tolerance 0.12% of mid ≈ 25pts@21k
 VP_WEIGHT_SCALE  = 0.08   # VP zone score → feature weight (scores ~5-80 → 0.4-6.4)
 GEX_WEIGHT_SCALE = 0.08   # GEX zone score → feature weight (same scale)
-HOD_LOD_TOL      = 10.0   # default coverage band half-width (20pt full band)
+HOD_LOD_TOL      = 7.5    # default coverage band half-width (15pt full band)
 
 # Extra structural families (all validated to add coverage):
 #   cam=Camarilla pivots  piv=floor pivots  pdc=prior close/mid/vwap
