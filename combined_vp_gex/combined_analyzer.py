@@ -715,7 +715,7 @@ def plot_sample_days(df: pd.DataFrame, vix_series: pd.Series,
     from matplotlib.collections import LineCollection
     from matplotlib.colors import LinearSegmentedColormap
 
-    CMAP = LinearSegmentedColormap.from_list("combined", ["#FF8C00", "#FF0050"])
+    CMAP = LinearSegmentedColormap.from_list("combined", ["#DD33DD", "#DD00DD"])
     DARK = "#0D1117"
 
     if seed is not None:
