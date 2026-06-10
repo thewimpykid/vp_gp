@@ -1,0 +1,45 @@
+{
+  "config": {
+    "d": 0.55,
+    "z_entry": 1.5,
+    "z_confirm": 0.5,
+    "stop_pts": 20.0,
+    "min_tgt": 15.0,
+    "max_tgt": 45.0,
+    "de_min": 0.1,
+    "de_max": 1.0,
+    "persist": 2,
+    "cooldown": 15,
+    "trend_gate": true
+  },
+  "opt_2024": {
+    "sharpe": 0.967,
+    "trades": 504,
+    "wr": 0.4841,
+    "rr": 1.249,
+    "avg_w": 24.54,
+    "avg_l": 19.64,
+    "total_pts": 881.2,
+    "avg_trade": 1.75,
+    "max_dd_pts": 327.0,
+    "expectancy": 1.75,
+    "n_tgt": 221,
+    "n_stop": 251,
+    "n_time": 32
+  },
+  "test_2025": {
+    "sharpe": 0.292,
+    "trades": 180,
+    "wr": 0.4611,
+    "rr": 1.224,
+    "avg_w": 24.11,
+    "avg_l": 19.7,
+    "total_pts": 90.2,
+    "avg_trade": 0.5,
+    "max_dd_pts": 299.8,
+    "expectancy": 0.5,
+    "n_tgt": 78,
+    "n_stop": 94,
+    "n_time": 8
+  }
+}
