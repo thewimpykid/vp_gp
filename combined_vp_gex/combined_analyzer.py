@@ -45,11 +45,24 @@ for _p in [str(HERE), str(VP_DIR), str(GEX_DIR)]:
         sys.path.insert(0, _p)
 
 # ─── Parameters ───────────────────────────────────────────────────────────────
+# Band-coverage optimized (optimize_bands.py, tuned 2024 / validated 2025):
+#   ±10pt band: HOD 88.4% / LOD 86.8%   ±7.5pt band: HOD 81.7% / LOD 78.5%
+#   Lift vs equal-density random levels: +10-12%
 BIN_SIZE         = 5.0
-STACK_TOLERANCE  = 3.0    # cluster radius = 3 × 5pt = 15pt
+STACK_TOLERANCE  = 0.75   # cluster radius = 0.75 × 5pt = 3.75pt (tight, was 3.0)
+SNAP_CENTER      = True   # zone center = heaviest member price (not cluster mean)
 TOL_PCT          = 0.0012 # HOD/LOD tolerance 0.12% of mid ≈ 25pts@21k
 VP_WEIGHT_SCALE  = 0.08   # VP zone score → feature weight (scores ~5-80 → 0.4-6.4)
 GEX_WEIGHT_SCALE = 0.08   # GEX zone score → feature weight (same scale)
+HOD_LOD_TOL      = 10.0   # default coverage band half-width (20pt full band)
+
+# Extra structural families (all validated to add coverage):
+#   cam=Camarilla pivots  piv=floor pivots  pdc=prior close/mid/vwap
+#   em=implied expected-move bands  pw=prior week close/mid  atr=ATR projections
+#   ladder/ladder2=interior ATR ladders  ext/ext2=breakout extension ladders
+EXTRA_FAMILIES   = {"cam", "piv", "pdc", "em", "pw", "atr",
+                    "ladder", "ladder2", "ext", "ext2"}
+NQ_IV_MULT       = 1.15
 
 
 # ─── Data Classes ─────────────────────────────────────────────────────────────
@@ -98,6 +111,86 @@ def _zones_to_features(zones: list, system: str,
     return feats
 
 
+def _extra_struct_features(df: pd.DataFrame, vix_series: pd.Series,
+                           families: set = None) -> list[VPFeature]:
+    """
+    Extra structural level families computed from prior completed sessions only
+    (df is the walk-forward window — everything in it is prior data).
+    Validated by optimize_bands.py: breakout extension ladders (ext/ext2) fix
+    the dominant miss mode (73% of HOD misses were breakouts beyond PDH,
+    median extension only +0.22 ATR).
+    """
+    import gex_profile as _gex
+
+    families = EXTRA_FAMILIES if families is None else families
+    df2 = df.copy()
+    df2["_d"] = df2["date"].dt.date
+    daily = df2.groupby("_d").agg(
+        h=("high", "max"), l=("low", "min"), c=("close", "last"),
+        v=("volume", "sum"),
+    )
+    pv = (df2["close"] * df2["volume"]).groupby(df2["_d"]).sum()
+    daily["vwap"] = pv / daily["v"].replace(0, np.nan)
+    if len(daily) < 2:
+        return []
+
+    prow = daily.iloc[-1]
+    H, L, C = float(prow["h"]), float(prow["l"]), float(prow["c"])
+    R = H - L
+    a = _gex.compute_atr20(df)
+    last_dt = df2["date"].iloc[-1]
+    vix_val = _gex.get_vix_at(vix_series, last_dt)
+
+    # prior completed week relative to the upcoming session (next calendar day)
+    nxt   = last_dt + pd.Timedelta(days=1)
+    wk_id = (nxt.isocalendar().year, nxt.isocalendar().week)
+    pdays = daily.index.tolist()[-6:]
+    pweek = [d for d in pdays
+             if (pd.Timestamp(d).isocalendar().year,
+                 pd.Timestamp(d).isocalendar().week) != wk_id]
+
+    out: list[tuple] = []
+    if "cam" in families:
+        out += [(C + R * 1.1 / 4, 1.4, "camR3"), (C - R * 1.1 / 4, 1.4, "camS3"),
+                (C + R * 1.1 / 2, 1.5, "camR4"), (C - R * 1.1 / 2, 1.5, "camS4"),
+                (C + R * 1.1 / 6, 1.0, "camR2"), (C - R * 1.1 / 6, 1.0, "camS2")]
+    if "piv" in families:
+        P = (H + L + C) / 3
+        out += [(P, 1.2, "pivP"),
+                (2 * P - L, 1.3, "pivR1"), (2 * P - H, 1.3, "pivS1"),
+                (P + R, 1.2, "pivR2"),     (P - R, 1.2, "pivS2")]
+    if "pdc" in families:
+        out += [(C, 1.3, "pdc"), ((H + L) / 2, 1.2, "pdm"),
+                (float(prow["vwap"]), 1.3, "pdvwap")]
+    if "em" in families:
+        sig_d = (vix_val / 100.0) * NQ_IV_MULT / np.sqrt(252) * C
+        out += [(C + sig_d, 1.3, "em+1s"), (C - sig_d, 1.3, "em-1s"),
+                (C + 0.5 * sig_d, 1.1, "em+.5s"), (C - 0.5 * sig_d, 1.1, "em-.5s")]
+    if "pw" in families and pweek:
+        pw_h = max(daily.loc[d, "h"] for d in pweek)
+        pw_l = min(daily.loc[d, "l"] for d in pweek)
+        pw_c = daily.loc[pweek[-1], "c"]
+        out += [(float(pw_c), 1.1, "pwc"), ((pw_h + pw_l) / 2, 1.1, "pwm")]
+    if "atr" in families:
+        out += [(C + 0.5 * a, 1.2, "atr+.5"), (C - 0.5 * a, 1.2, "atr-.5"),
+                (C + 1.0 * a, 1.2, "atr+1"),  (C - 1.0 * a, 1.2, "atr-1")]
+    if "ladder" in families:
+        for k in [0.25, 0.4, 0.55, 0.7, 0.85, 1.0, 1.2, 1.4]:
+            out += [(C + k * a, 1.0, f"lad+{k}"), (C - k * a, 1.0, f"lad-{k}")]
+    if "ladder2" in families:
+        for k in [0.15, 0.27, 0.39, 0.51, 0.63, 0.75, 0.88, 1.02, 1.18, 1.35]:
+            out += [(C + k * a, 0.9, f"l2+{k}"), (C - k * a, 0.9, f"l2-{k}")]
+    if "ext" in families:
+        for k in [0.08, 0.20, 0.33, 0.48, 0.65, 0.85]:
+            out += [(H + k * a, 1.2, f"ext+{k}"), (L - k * a, 1.2, f"ext-{k}")]
+    if "ext2" in families:
+        for k in [0.05, 0.11, 0.17, 0.24, 0.31, 0.39, 0.48, 0.58, 0.70, 0.84, 1.0]:
+            out += [(H + k * a, 1.1, f"x2+{k}"), (L - k * a, 1.1, f"x2-{k}")]
+
+    return [VPFeature(price=float(p), ftype=tag, timeframe=f"x__{tag}", weight=w)
+            for p, w, tag in out if np.isfinite(p)]
+
+
 def _stack(all_features: list[VPFeature], bin_size: float,
            tol_mult: float = STACK_TOLERANCE) -> list[Zone]:
     """Greedy price-proximity clustering. Score = n_tf^2 × Σweights."""
@@ -123,7 +216,10 @@ def _stack(all_features: list[VPFeature], bin_size: float,
                 cluster.append(all_features[j])
                 used[j] = True
 
-        center  = float(np.mean([f.price for f in cluster]))
+        if SNAP_CENTER:
+            center = float(max(cluster, key=lambda f: f.weight).price)
+        else:
+            center = float(np.mean([f.price for f in cluster]))
         tfs     = {f.timeframe for f in cluster}
         ftypes  = {f.ftype for f in cluster}
         systems = {f.timeframe.split("__")[0] for f in cluster}
@@ -154,19 +250,21 @@ def run(df: pd.DataFrame, vix_series: pd.Series,
 
     vp_feats  = _zones_to_features(vp_zones,  "vp",  VP_WEIGHT_SCALE)
     gex_feats = _zones_to_features(gex_zones, "gex", GEX_WEIGHT_SCALE)
-    combined  = _stack(vp_feats + gex_feats, bin_size)
+    x_feats   = _extra_struct_features(df, vix_series)
+    combined  = _stack(vp_feats + gex_feats + x_feats, bin_size)
 
     if not quiet:
-        cross = sum(1 for z in combined if len(z.systems) == 2)
+        cross = sum(1 for z in combined if len(z.systems) >= 2)
         print(f"  VP {len(vp_zones)} zones + GEX {len(gex_zones)} zones "
-              f"→ {len(combined)} combined  ({cross} cross-system boosted)")
+              f"+ {len(x_feats)} struct feats → {len(combined)} combined  "
+              f"({cross} cross-system boosted)")
     return combined, avg_vix
 
 
 # ─── HOD/LOD coverage ────────────────────────────────────────────────────────
 
 def hod_lod_coverage(df: pd.DataFrame, vix_series: pd.Series,
-                     n_days: int = 60, tol_pct: float = TOL_PCT,
+                     n_days: int = 60, tolerance_pts: float = HOD_LOD_TOL,
                      bin_size: float = BIN_SIZE, seed: int = 42,
                      quiet_days: bool = False) -> dict:
     rng = np.random.default_rng(seed)
@@ -190,7 +288,7 @@ def hod_lod_coverage(df: pd.DataFrame, vix_series: pd.Series,
     sep = "-" * 76
     if not quiet_days:
         print(f"\n  Combined VP+GEX HOD/LOD  ({len(sample)} days, "
-              f"tol={tol_pct*100:.2f}%)")
+              f"tol=±{tolerance_pts:.0f}pts fixed)")
         print(sep)
         print(f"  {'DATE':<12}  {'HOD':>8}  {'LOD':>8}  {'dHOD':>6}  {'dLOD':>6}  HOD  LOD")
         print(sep)
@@ -206,7 +304,7 @@ def hod_lod_coverage(df: pd.DataFrame, vix_series: pd.Series,
         zp      = np.array([z.price for z in zones])
         hod     = float(day_stats.loc[day, "hod"])
         lod     = float(day_stats.loc[day, "lod"])
-        tol     = ((hod + lod) / 2) * tol_pct
+        tol     = tolerance_pts
         hd      = float(np.min(np.abs(zp - hod)))
         ld      = float(np.min(np.abs(zp - lod)))
         hod_hit = hd <= tol
@@ -242,7 +340,7 @@ def hod_lod_coverage(df: pd.DataFrame, vix_series: pd.Series,
 
 def full_coverage_date_range(df: pd.DataFrame, vix_series: pd.Series,
                               start_date: str, end_date: str,
-                              tol_pct: float = TOL_PCT,
+                              tolerance_pts: float = HOD_LOD_TOL,
                               bin_size: float = BIN_SIZE) -> dict:
     """All-days HOD/LOD in date range. No sampling."""
     df2 = df.copy()
@@ -274,7 +372,7 @@ def full_coverage_date_range(df: pd.DataFrame, vix_series: pd.Series,
         zp      = np.array([z.price for z in zones])
         hod     = float(day_stats.loc[day, "hod"])
         lod     = float(day_stats.loc[day, "lod"])
-        tol     = ((hod + lod) / 2) * tol_pct
+        tol     = tolerance_pts
         hd      = float(np.min(np.abs(zp - hod)))
         ld      = float(np.min(np.abs(zp - lod)))
         hod_hit = hd <= tol
@@ -301,8 +399,20 @@ def full_coverage_date_range(df: pd.DataFrame, vix_series: pd.Series,
 
 # ─── Reversal backtest ────────────────────────────────────────────────────────
 
+def _cap_daily(indices: list, dates_arr, max_per_day: int = 2) -> list:
+    counts: dict = {}
+    out: list = []
+    for t in indices:
+        d = pd.Timestamp(dates_arr[t]).date()
+        c = counts.get(d, 0)
+        if c < max_per_day:
+            counts[d] = c + 1
+            out.append(t)
+    return out
+
+
 def _reversal_test(df: pd.DataFrame, zones: list,
-                   tolerance: float = BIN_SIZE,
+                   tolerance: float = 15.0,
                    forward_bars: int = 390,
                    min_sep_bars:  int = 240,
                    reversal_pct:  float = 0.006,
@@ -310,6 +420,7 @@ def _reversal_test(df: pd.DataFrame, zones: list,
     hi = df["high"].values.astype(np.float64)
     lo = df["low"].values.astype(np.float64)
     cl = df["close"].values.astype(np.float64)
+    dt = df["date"].values
     n  = len(df)
     rows = []
     for zone in zones:
@@ -321,6 +432,7 @@ def _reversal_test(df: pd.DataFrame, zones: list,
         for t in raw_t:
             if t - last_t >= min_sep_bars:
                 deduped.append(t); last_t = t
+        deduped = _cap_daily(deduped, dt)
         total = len(deduped); revs = 0; moves: list[float] = []
         for t in deduped:
             tp  = cl[t]; thr = reversal_pct * tp
@@ -337,7 +449,7 @@ def _reversal_test(df: pd.DataFrame, zones: list,
             if move >= thr:
                 revs += 1; moves.append(move / tp * 100)
         sys_set = getattr(zone, "systems", set())
-        cross   = len(sys_set) == 2
+        cross   = {"vp", "gex"} <= sys_set
         rows.append(dict(
             price=round(zone.price, 2),
             score=round(zone.score, 2),
@@ -355,13 +467,14 @@ def _reversal_test(df: pd.DataFrame, zones: list,
 
 
 def _baseline_reversal(df: pd.DataFrame, n_samples: int = 40,
-                        tolerance: float = BIN_SIZE,
+                        tolerance: float = 15.0,
                         forward_bars: int = 390,
                         min_sep_bars: int = 240,
                         reversal_pct: float = 0.006) -> float:
     hi = df["high"].values.astype(np.float64)
     lo = df["low"].values.astype(np.float64)
     cl = df["close"].values.astype(np.float64)
+    dt = df["date"].values
     n  = len(df)
     rng = np.random.default_rng(42)
     prices = rng.uniform(lo.min(), hi.max(), size=n_samples * 3)
@@ -374,6 +487,7 @@ def _baseline_reversal(df: pd.DataFrame, n_samples: int = 40,
         ded = []; lt = -min_sep_bars
         for t in raw:
             if t - lt >= min_sep_bars: ded.append(t); lt = t
+        ded = _cap_daily(ded, dt)
         if len(ded) < 10: continue
         revs = 0
         for t in ded:
@@ -497,7 +611,7 @@ def compare_three_way(df: pd.DataFrame, vix_series: pd.Series,
 
     print(f"\n  3-way comparison: {start} → {end}  ({len(eligible)} days)")
 
-    tol_pct = TOL_PCT
+    tolerance_pts = HOD_LOD_TOL
     results: dict[str, dict] = {
         "vp": dict(hod=0, lod=0, both=0, n=0, hd=[], ld=[]),
         "gex": dict(hod=0, lod=0, both=0, n=0, hd=[], ld=[]),
@@ -516,7 +630,7 @@ def compare_three_way(df: pd.DataFrame, vix_series: pd.Series,
 
         hod = float(day_stats.loc[day, "hod"])
         lod = float(day_stats.loc[day, "lod"])
-        tol = ((hod + lod) / 2) * tol_pct
+        tol = tolerance_pts
 
         for sys_name, zones in [("vp", vp_zones), ("gex", gex_zones), ("comb", comb_zones)]:
             if not zones:
@@ -543,7 +657,7 @@ def compare_three_way(df: pd.DataFrame, vix_series: pd.Series,
     # Print comparison table
     sep = "=" * 80
     print(f"\n{sep}")
-    print(f"  3-WAY HOD/LOD COMPARISON  {start} → {end}  (tol={tol_pct*100:.2f}%)")
+    print(f"  3-WAY HOD/LOD COMPARISON  {start} → {end}  (tol=±{tolerance_pts:.0f}pts fixed)")
     print(sep)
     print(f"  {'System':<12}  {'HOD':>6}  {'LOD':>6}  {'Both':>6}  "
           f"{'avgHOD':>8}  {'avgLOD':>8}  {'n':>5}")
@@ -697,7 +811,7 @@ def plot_sample_days(df: pd.DataFrame, vix_series: pd.Series,
             ns     = zone.score / max_score
             colour = CMAP(0.20 + 0.80 * ns)
             hw     = zone.price * 0.0005
-            cross  = len(zone.systems) == 2
+            cross  = {"vp", "gex"} <= zone.systems
             ax.axhspan(zone.price - hw, zone.price + hw,
                        color=colour, alpha=(0.10 + 0.40 * ns) * (1.5 if cross else 1.0),
                        linewidth=0)
@@ -724,7 +838,7 @@ def plot_sample_days(df: pd.DataFrame, vix_series: pd.Series,
         ax.tick_params(axis="y", colors="#8B949E", labelsize=8)
         ax.tick_params(axis="x", colors="#8B949E", labelsize=7, length=3)
         ax.set_ylabel("Price  (NQ)", color="#8B949E", fontsize=9)
-        cross_n = sum(1 for z in selected if len(z.systems) == 2)
+        cross_n = sum(1 for z in selected if {"vp", "gex"} <= z.systems)
         ax.set_title(
             f"NQ Combined VP+GEX  {day}  ·  {len(selected)} zones  "
             f"({cross_n} cross-system)  ·  VIX≈{avg_vix:.1f}  (no look-ahead · orange=solid = VP+GEX overlap)",
@@ -804,11 +918,11 @@ def main():
     print(f"  {'PRICE':>9}  {'SCORE':>7}  {'TF':>3}  {'SYSTEMS':<10}  FEATURE TYPES")
     print(sep)
     for z in zones[:args.top]:
-        sys_s = "VP+GEX" if len(z.systems) == 2 else "|".join(sorted(z.systems))
+        sys_s = "VP+GEX" if {"vp", "gex"} <= z.systems else "|".join(sorted(z.systems))
         fts   = "|".join(sorted(z.ftypes))
         print(f"  {z.price:>9.2f}  {z.score:>7.2f}  {z.n_tf:>3}  {sys_s:<10}  {fts}")
     print(sep)
-    cross = sum(1 for z in zones if len(z.systems) == 2)
+    cross = sum(1 for z in zones if {"vp", "gex"} <= z.systems)
     print(f"  Cross-system zones (VP+GEX): {cross} / {len(zones)}")
 
 

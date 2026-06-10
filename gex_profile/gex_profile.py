@@ -117,6 +117,8 @@ class VPFeature:
     ftype:     str
     timeframe: str
     weight:    float = 1.0
+    side:      str   = "neutral"   # "call" (above session close), "put" (below), "neutral"
+    magnitude: float = 0.0         # normalized GEX at this price (0.0–1.0)
 
 
 @dataclass
@@ -301,16 +303,21 @@ def build_0dte_session(session_bars: pd.DataFrame, spot_close: float,
 
 # ─── Feature Detection ────────────────────────────────────────────────────────
 
+def _tag(price: float, ftype: str, tf: str, weight: float,
+         spot: float, smooth: np.ndarray, bins: np.ndarray, peak_vol: float) -> VPFeature:
+    """Create VPFeature with side (call/put relative to session close) and normalized magnitude."""
+    side = "call" if price > spot else ("put" if price < spot else "neutral")
+    idx  = int(round((price - bins[0]) / (bins[1] - bins[0]))) if len(bins) > 1 else 0
+    idx  = max(0, min(len(smooth) - 1, idx))
+    mag  = float(smooth[idx] / peak_vol) if peak_vol > 1e-9 else 0.0
+    return VPFeature(price, ftype, tf, weight, side=side, magnitude=mag)
+
+
 def detect_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
     feats: list[VPFeature] = []
     bins, vols = vp.bins, vp.vols
-    tf = vp.name
-
-    feats += [
-        VPFeature(vp.vah, "vah", tf, weight=1.2),
-        VPFeature(vp.val, "val", tf, weight=1.2),
-        VPFeature(vp.poc, "poc", tf, weight=1.1),
-    ]
+    tf   = vp.name
+    spot = vp.spot
 
     n   = len(vols)
     win = max(5, n // 15)
@@ -323,6 +330,13 @@ def detect_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
 
     peak_vol = smooth.max()
     mean_vol = smooth.mean()
+
+    feats += [
+        _tag(vp.vah, "vah", tf, 1.2, spot, smooth, bins, peak_vol),
+        _tag(vp.val, "val", tf, 1.2, spot, smooth, bins, peak_vol),
+        _tag(vp.poc, "poc", tf, 1.1, spot, smooth, bins, peak_vol),
+    ]
+
     if peak_vol < 1e-9:
         return feats
 
@@ -335,19 +349,19 @@ def detect_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
             continue
         l_idx = int(np.clip(lo_ips[0], 0, n - 1))
         r_idx = int(np.clip(hi_ips[0], 0, n - 1))
-        _classify_boundary(smooth, bins, l_idx, "lower", peak_vol, tf, feats)
-        _classify_boundary(smooth, bins, r_idx, "upper", peak_vol, tf, feats)
+        _classify_boundary(smooth, bins, l_idx, "lower", peak_vol, tf, feats, spot)
+        _classify_boundary(smooth, bins, r_idx, "upper", peak_vol, tf, feats, spot)
 
     # LVN valleys
     valleys, _ = find_peaks(-smooth, prominence=0.08 * peak_vol)
     for v in valleys:
         if smooth[v] < LVN_DEPTH * mean_vol:
-            feats.append(VPFeature(float(bins[v]), "lvn", tf, weight=0.9))
+            feats.append(_tag(float(bins[v]), "lvn", tf, 0.9, spot, smooth, bins, peak_vol))
 
     return feats
 
 
-def _classify_boundary(smooth, bins, edge_idx, side, peak_vol, tf, feats):
+def _classify_boundary(smooth, bins, edge_idx, side, peak_vol, tf, feats, spot: float = 0.0):
     n = len(smooth)
     if side == "lower":
         indices = list(range(edge_idx, max(-1, edge_idx - SLOPE_BINS - 1), -1))
@@ -362,9 +376,9 @@ def _classify_boundary(smooth, bins, edge_idx, side, peak_vol, tf, feats):
     price     = float(bins[edge_idx])
 
     if avg_slope <= SHELF_SLOPE_MAX and INCLUDE_SHELF:
-        feats.append(VPFeature(price, "shelf", tf, weight=0.8))
+        feats.append(_tag(price, "shelf", tf, 0.8, spot, smooth, bins, peak_vol))
     elif avg_slope >= LEDGE_SLOPE_MIN and INCLUDE_LEDGE:
-        feats.append(VPFeature(price, "ledge", tf, weight=1.3))
+        feats.append(_tag(price, "ledge", tf, 1.3, spot, smooth, bins, peak_vol))
 
 
 def detect_gex_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
@@ -395,6 +409,8 @@ def detect_gex_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
     abs_grad = np.abs(grad)
     ag_max   = abs_grad.max()
 
+    spot = vp.spot
+
     if USE_GWALL and ag_max > 1e-12:
         wall_peaks, props = find_peaks(
             abs_grad, prominence=GWALL_PROMINENCE * ag_max,
@@ -406,7 +422,7 @@ def detect_gex_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
             for idx in order:
                 p = wall_peaks[idx]
                 if smooth[p] >= 0.15 * peak_vol:
-                    feats.append(VPFeature(float(bins[p]), "gwall", tf, weight=1.1))
+                    feats.append(_tag(float(bins[p]), "gwall", tf, 1.1, spot, smooth, bins, peak_vol))
 
     if USE_GFLIP:
         d2      = np.gradient(grad, bin_size)
@@ -419,7 +435,7 @@ def detect_gex_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
                 cands.append((local_gex * local_grad, i))
         cands.sort(reverse=True)
         for _, i in cands[:2]:
-            feats.append(VPFeature(float(bins[i]), "gflip", tf, weight=1.3))
+            feats.append(_tag(float(bins[i]), "gflip", tf, 1.3, spot, smooth, bins, peak_vol))
 
     return feats
 
@@ -523,6 +539,78 @@ def round_number_features(df: pd.DataFrame, atr20: float) -> list:
     return feats
 
 
+# ─── Temporal GEX Gradient (horizontal, cross-session) ───────────────────────
+
+def detect_temporal_gradient(profiles: dict, bin_size: float = BIN_SIZE,
+                              min_sessions: int = 3,
+                              slope_threshold: float = 0.06) -> list:
+    """
+    For each price bin, compute linear slope of normalized GEX across sessions
+    ordered oldest→newest (d-5→d-1). Positive slope = GEX building at that price.
+    Returns gex_build (rising) and gex_fade (falling) features.
+    No leakage: uses only prior-session data already in profiles dict.
+    Uses UNION bin grid with zero-interpolation for out-of-range bins.
+    """
+    # Sort oldest→newest: d-5 first, d-1 last (reverse=True gives d-5 > d-4 > ... > d-1)
+    session_keys = sorted(
+        [k for k in profiles if k.startswith("0dte_")],
+        reverse=True   # ["0dte_d-5", "0dte_d-4", "0dte_d-3", "0dte_d-2", "0dte_d-1"]
+    )
+    if len(session_keys) < min_sessions:
+        return []
+
+    # Build UNION bin grid across all sessions
+    all_bin_ints: set = set()
+    for k in session_keys:
+        for b in np.round(profiles[k].bins / bin_size).astype(int):
+            all_bin_ints.add(int(b))
+    common_bins = np.array(sorted(all_bin_ints), dtype=float) * bin_size
+    if len(common_bins) < 5:
+        return []
+
+    # Interpolate each session's GEX onto union grid, normalize by session peak
+    n_sess  = len(session_keys)
+    gex_mat = np.zeros((n_sess, len(common_bins)))
+    for si, k in enumerate(session_keys):
+        vp   = profiles[k]
+        vals = np.interp(common_bins, vp.bins, vp.vols, left=0.0, right=0.0)
+        pk   = vals.max()
+        if pk > 1e-9:
+            vals /= pk
+        gex_mat[si] = vals
+
+    # Linear regression slope at each bin (x=0 = oldest, x=n-1 = newest)
+    x      = np.arange(n_sess, dtype=float)
+    x_mean = x.mean()
+    x_var  = ((x - x_mean) ** 2).sum()
+    if x_var < 1e-12:
+        return []
+
+    slopes = np.array([
+        np.dot(x - x_mean, gex_mat[:, bi] - gex_mat[:, bi].mean()) / x_var
+        for bi in range(len(common_bins))
+    ])
+
+    # session_keys[-1] = "0dte_d-1" = most recent session
+    recent_spot = profiles[session_keys[-1]].spot
+
+    feats: list[VPFeature] = []
+    for bi, price in enumerate(common_bins):
+        sl  = slopes[bi]
+        mag = float(gex_mat[-1, bi])   # d-1 (most recent) normalized GEX
+        if mag < 0.04:                  # skip near-zero bins
+            continue
+        side = "call" if price > recent_spot else ("put" if price < recent_spot else "neutral")
+        if sl > slope_threshold:
+            feats.append(VPFeature(float(price), "gex_build", "temporal_grad",
+                                   weight=1.2, side=side, magnitude=mag))
+        elif sl < -slope_threshold:
+            feats.append(VPFeature(float(price), "gex_fade", "temporal_grad",
+                                   weight=0.7, side=side, magnitude=mag))
+
+    return feats
+
+
 # ─── Confluence Stacking ──────────────────────────────────────────────────────
 
 def stack_features(all_features: list, bin_size: float,
@@ -613,11 +701,25 @@ def run(df: pd.DataFrame, vix_series: pd.Series,
                   f"VIX={day_vix:.1f}  σ={sigma_nq:.3f}  "
                   f"feats={len(feats)}  gwall={gw}  gflip={gf}")
 
-    # Structural levels
-    all_features.extend(prior_day_features(df))
-    all_features.extend(session_level_features(df))
+    # Temporal gradient across sessions (horizontal GEX slope, no leakage)
+    if len(profiles) >= 3:
+        grad_feats = detect_temporal_gradient(profiles, bin_size)
+        all_features.extend(grad_feats)
+        if not quiet and grad_feats:
+            n_build = sum(1 for f in grad_feats if f.ftype == "gex_build")
+            n_fade  = sum(1 for f in grad_feats if f.ftype == "gex_fade")
+            print(f"  [temporal_grad]  gex_build={n_build}  gex_fade={n_fade}")
+
+    # Structural levels — tag side relative to last close
+    last_close = float(df["close"].iloc[-1])
+    struct_feats: list[VPFeature] = []
+    struct_feats.extend(prior_day_features(df))
+    struct_feats.extend(session_level_features(df))
     atr20 = compute_atr20(df)
-    all_features.extend(round_number_features(df, atr20))
+    struct_feats.extend(round_number_features(df, atr20))
+    for f in struct_feats:
+        f.side = "call" if f.price > last_close else ("put" if f.price < last_close else "neutral")
+    all_features.extend(struct_feats)
 
     zones    = stack_features(all_features, bin_size)
     avg_vix  = float(np.mean([
@@ -706,6 +808,19 @@ def print_daily_levels(levels, last_close, atr20):
 
 # ─── Backtest ─────────────────────────────────────────────────────────────────
 
+def _cap_daily(indices: list[int], dates_arr, max_per_day: int = 2) -> list[int]:
+    """Keep at most max_per_day touch indices per calendar day."""
+    counts: dict = {}
+    out: list[int] = []
+    for t in indices:
+        d = pd.Timestamp(dates_arr[t]).date()
+        c = counts.get(d, 0)
+        if c < max_per_day:
+            counts[d] = c + 1
+            out.append(t)
+    return out
+
+
 def backtest(df, zones, tolerance=BIN_SIZE, years=3,
              lookback_bars=60, forward_bars=390, min_sep_bars=240,
              reversal_pct=0.006, quiet=False):
@@ -715,6 +830,7 @@ def backtest(df, zones, tolerance=BIN_SIZE, years=3,
     hi  = df3["high"].values.astype(np.float64)
     lo  = df3["low"].values.astype(np.float64)
     cl  = df3["close"].values.astype(np.float64)
+    dt  = df3["date"].values  # pandas Timestamps
     n   = len(df3)
     if not quiet:
         print(f"  Backtest: {df3['date'].iloc[0].date()} → {df3['date'].iloc[-1].date()}  ({n:,} bars)")
@@ -730,6 +846,7 @@ def backtest(df, zones, tolerance=BIN_SIZE, years=3,
         for t in raw_touches:
             if t - last_t >= min_sep_bars:
                 deduped.append(t); last_t = t
+        deduped = _cap_daily(deduped, dt)
 
         total = len(deduped); reversals = 0; rev_moves: list[float] = []
         for t in deduped:
@@ -754,12 +871,26 @@ def backtest(df, zones, tolerance=BIN_SIZE, years=3,
                 reversals += 1
                 rev_moves.append(move / tp * 100)
 
+        # call/put side: majority vote from GEX features in zone
+        gex_feats  = [f for f in zone.features if f.timeframe.startswith("0dte") or
+                      f.timeframe == "temporal_grad"]
+        call_cnt   = sum(1 for f in gex_feats if f.side == "call")
+        put_cnt    = sum(1 for f in gex_feats if f.side == "put")
+        zone_side  = "call" if call_cnt > put_cnt else ("put" if put_cnt > call_cnt else "neutral")
+        avg_mag    = float(np.mean([f.magnitude for f in gex_feats])) if gex_feats else 0.0
+        has_build  = any(f.ftype == "gex_build" for f in zone.features)
+        has_fade   = any(f.ftype == "gex_fade"  for f in zone.features)
+
         rows.append({
             "price":         round(zone.price, 2),
             "score":         round(zone.score, 1),
             "n_tf":          zone.n_tf,
             "n_0dte":        sum(1 for t in zone.timeframes if t.startswith("0dte")),
             "ftypes":        "|".join(sorted(zone.ftypes)),
+            "zone_side":     zone_side,
+            "avg_magnitude": round(avg_mag, 3),
+            "has_build":     has_build,
+            "has_fade":      has_fade,
             "touches":       total,
             "reversals":     reversals,
             "reversal_rate": round(reversals / total, 3) if total > 0 else 0.0,
@@ -779,6 +910,7 @@ def _baseline_rate(df, n_samples, tolerance, forward_bars, min_sep_bars,
     hi  = df3["high"].values.astype(np.float64)
     lo  = df3["low"].values.astype(np.float64)
     cl  = df3["close"].values.astype(np.float64)
+    dt  = df3["date"].values
     n   = len(df3)
 
     all_rates, all_touches = [], []
@@ -793,6 +925,7 @@ def _baseline_rate(df, n_samples, tolerance, forward_bars, min_sep_bars,
         for t in raw:
             if t - last_t >= min_sep_bars:
                 deduped.append(t); last_t = t
+        deduped = _cap_daily(deduped, dt)
         if len(deduped) < 10: continue
         revs = 0
         for t in deduped:
@@ -813,7 +946,7 @@ def _baseline_rate(df, n_samples, tolerance, forward_bars, min_sep_bars,
     return float(sum(r * t for r, t in zip(all_rates, all_touches)) / total_t)
 
 
-def print_backtest_report(df, bt, reversal_pct=0.006, tolerance=BIN_SIZE,
+def print_backtest_report(df, bt, reversal_pct=0.006, tolerance=15.0,
                            forward_bars=390, min_sep_bars=240):
     print("  Computing baseline (30 random levels)...", end="", flush=True)
     baseline = _baseline_rate(df, 30, tolerance, forward_bars, min_sep_bars,
@@ -844,41 +977,86 @@ def print_backtest_report(df, bt, reversal_pct=0.006, tolerance=BIN_SIZE,
     print(f"  Zones beating +5%         : {int((bt['reversal_rate'] - baseline >= 0.05).sum())} / {len(bt)}")
     print(f"  Zones beating +10%        : {int((bt['reversal_rate'] - baseline >= 0.10).sum())} / {len(bt)}")
 
-    print(f"\n  Feature-type breakdown (touch-weighted reversal rate vs baseline {baseline:.1%}):")
-    ftypes_to_check = ["gflip", "gwall", "ledge", "shelf", "vah", "val", "poc",
-                        "lvn", "ibh", "ibl", "pdh", "pdl", "round"]
+    def _wt_rate(sub):
+        tt = sub["touches"].sum()
+        if tt == 0: return 0.0, 0
+        return float((sub["reversal_rate"] * sub["touches"]).sum() / tt), int(tt)
+
+    print(f"\n  Feature-type breakdown (touch-weighted rate vs baseline {baseline:.1%}):")
+    ftypes_to_check = ["gex_build", "gex_fade", "gflip", "gwall", "ledge", "shelf",
+                       "vah", "val", "poc", "lvn", "ibh", "ibl", "pdh", "pdl", "round"]
     rows_out = []
     for ftype in ftypes_to_check:
         sub = bt[bt["ftypes"].str.contains(ftype, na=False)]
         if len(sub) == 0: continue
-        t_total = sub["touches"].sum()
-        if t_total == 0: continue
-        wr     = float((sub["reversal_rate"] * sub["touches"]).sum() / t_total)
+        wr, tt = _wt_rate(sub)
+        if tt == 0: continue
         lift_f = wr - baseline
-        rows_out.append((lift_f, ftype, len(sub), t_total, wr))
+        rows_out.append((lift_f, ftype, len(sub), tt, wr))
     rows_out.sort(reverse=True)
     for lift_f, ftype, nz, tt, wr in rows_out:
         bar = "#" * int(max(0, lift_f) * 100) + ("." * int(max(0, -lift_f) * 20))
-        print(f"    {ftype:<8}  zones={nz:>2}  touches={tt:>5}  "
+        print(f"    {ftype:<10}  zones={nz:>2}  touches={tt:>5}  "
               f"rate={wr:.1%}  lift={lift_f:+.1%}  {bar}")
 
+    # Call vs Put GEX zone breakdown
+    if "zone_side" in bt.columns:
+        print(f"\n  Call vs Put GEX zone breakdown (baseline {baseline:.1%}):")
+        for side_lbl in ["call", "put", "neutral"]:
+            sub = bt[bt["zone_side"] == side_lbl]
+            if len(sub) == 0: continue
+            wr, tt = _wt_rate(sub)
+            if tt == 0: continue
+            lift_f = wr - baseline
+            print(f"    {side_lbl:<8}  zones={len(sub):>2}  touches={tt:>5}  "
+                  f"rate={wr:.1%}  lift={lift_f:+.1%}")
+
+    # Temporal gradient (gex_build vs gex_fade zones)
+    if "has_build" in bt.columns:
+        print(f"\n  Temporal gradient zones (baseline {baseline:.1%}):")
+        for label, mask in [("gex_build zones", bt["has_build"]),
+                             ("gex_fade  zones", bt["has_fade"]),
+                             ("no gradient",     ~bt["has_build"] & ~bt["has_fade"])]:
+            sub = bt[mask]
+            if len(sub) == 0: continue
+            wr, tt = _wt_rate(sub)
+            if tt == 0: continue
+            lift_f = wr - baseline
+            print(f"    {label:<20}  zones={len(sub):>2}  touches={tt:>5}  "
+                  f"rate={wr:.1%}  lift={lift_f:+.1%}")
+
+    # Magnitude quartile breakdown (GEX zones only)
+    if "avg_magnitude" in bt.columns:
+        gex_bt = bt[bt["n_0dte"] > 0].copy()
+        if len(gex_bt) >= 4:
+            gex_bt["mag_q"] = pd.qcut(gex_bt["avg_magnitude"], 4,
+                                       labels=["Q1(low)", "Q2", "Q3", "Q4(high)"],
+                                       duplicates="drop")
+            print(f"\n  GEX magnitude quartile vs reversal rate (baseline {baseline:.1%}):")
+            for q in gex_bt["mag_q"].cat.categories:
+                sub = gex_bt[gex_bt["mag_q"] == q]
+                wr, tt = _wt_rate(sub)
+                if tt == 0: continue
+                lift_f = wr - baseline
+                print(f"    {str(q):<12}  zones={len(sub):>2}  touches={tt:>5}  "
+                      f"rate={wr:.1%}  lift={lift_f:+.1%}")
+
     # 0DTE session count breakdown
-    print(f"\n  0DTE session count vs reversal rate:")
+    print(f"\n  0DTE session count vs reversal rate (baseline {baseline:.1%}):")
     for n_dte in range(0, N_SESSIONS + 1):
         sub = bt[bt["n_0dte"] == n_dte]
         if len(sub) == 0: continue
-        t_total = sub["touches"].sum()
-        if t_total == 0: continue
-        wr     = float((sub["reversal_rate"] * sub["touches"]).sum() / t_total)
+        wr, tt = _wt_rate(sub)
+        if tt == 0: continue
         lift_f = wr - baseline
-        print(f"    {n_dte} 0DTE sessions  zones={len(sub):>2}  "
+        print(f"    {n_dte} 0DTE sessions  zones={len(sub):>2}  touches={tt:>5}  "
               f"rate={wr:.1%}  lift={lift_f:+.1%}")
 
 
 # ─── HOD/LOD Coverage ────────────────────────────────────────────────────────
 
 def hod_lod_coverage(df: pd.DataFrame, vix_series: pd.Series,
-                     n_days: int = 60, tolerance_pct: float = 0.0012,
+                     n_days: int = 60, tolerance_pts: float = 15.0,
                      bin_size: float = BIN_SIZE, seed: int = 42) -> dict:
     rng  = np.random.default_rng(seed)
     df2  = df.copy()
@@ -901,7 +1079,7 @@ def hod_lod_coverage(df: pd.DataFrame, vix_series: pd.Series,
     rows = []
     sep = "-" * 76
     print(f"\n  0DTE-GEX HOD/LOD coverage  ({len(sample)} days, "
-          f"tol={tolerance_pct*100:.2f}% ≈ {tolerance_pct*21000:.0f}pts@21k)")
+          f"tol=±{tolerance_pts:.0f}pts fixed)")
     print(sep)
     print(f"  {'DATE':<12}  {'HOD':>8}  {'LOD':>8}  {'VIX':>5}  "
           f"{'dHOD':>6}  {'dLOD':>6}  HOD  LOD")
@@ -922,7 +1100,7 @@ def hod_lod_coverage(df: pd.DataFrame, vix_series: pd.Series,
         zp       = np.array([z.price for z in zones])
         hod      = float(day_stats.loc[day, "hod"])
         lod      = float(day_stats.loc[day, "lod"])
-        tol      = ((hod + lod) / 2) * tolerance_pct
+        tol      = tolerance_pts
 
         hod_dist = float(np.min(np.abs(zp - hod)))
         lod_dist = float(np.min(np.abs(zp - lod)))
@@ -1160,7 +1338,7 @@ def _restore_cfg(originals: dict):
 
 def _fast_hod_lod(df: pd.DataFrame, vix_series: pd.Series,
                   days_list: list, bin_size: float = BIN_SIZE,
-                  tol_pct: float = 0.0012) -> dict:
+                  tolerance_pts: float = 15.0) -> dict:
     """Quiet HOD/LOD test on a fixed day list. Returns stats dict."""
     df2 = df.copy()
     df2["_day"] = df2["date"].dt.date
@@ -1184,7 +1362,7 @@ def _fast_hod_lod(df: pd.DataFrame, vix_series: pd.Series,
         zp      = np.array([z.price for z in zones])
         hod     = float(day_stats.loc[day, "hod"])
         lod     = float(day_stats.loc[day, "lod"])
-        tol     = ((hod + lod) / 2) * tol_pct
+        tol     = tolerance_pts
         hd      = float(np.min(np.abs(zp - hod)))
         ld      = float(np.min(np.abs(zp - lod)))
         hod_hit = hd <= tol
@@ -1294,7 +1472,7 @@ def optimize_gex(df: pd.DataFrame, vix_series: pd.Series,
 
 def full_coverage_date_range(df: pd.DataFrame, vix_series: pd.Series,
                              start_date: str, end_date: str,
-                             tol_pct: float = 0.0012,
+                             tolerance_pts: float = 15.0,
                              bin_size: float = BIN_SIZE) -> dict:
     """
     HOD/LOD coverage on ALL eligible trading days in [start_date, end_date].
@@ -1329,7 +1507,7 @@ def full_coverage_date_range(df: pd.DataFrame, vix_series: pd.Series,
         zp      = np.array([z.price for z in zones])
         hod     = float(day_stats.loc[day, "hod"])
         lod     = float(day_stats.loc[day, "lod"])
-        tol     = ((hod + lod) / 2) * tol_pct
+        tol     = tolerance_pts
         hd      = float(np.min(np.abs(zp - hod)))
         ld      = float(np.min(np.abs(zp - lod)))
         hod_hit = hd <= tol

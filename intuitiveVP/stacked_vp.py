@@ -523,14 +523,13 @@ def round_number_features(df: pd.DataFrame, atr20: float) -> list:
 
 
 def hod_lod_coverage(df: pd.DataFrame, n_days: int = 60,
-                     tolerance_pct: float = 0.0012,
+                     tolerance_pts: float = 15.0,
                      bin_size: float = BIN_SIZE,
                      seed: int = 42) -> dict:
     """
     Walk-forward HOD/LOD coverage test (zero look-ahead).
     For each sampled day: compute zones using only prior data, then check
-    whether any zone is within tolerance_pct*price of that day's actual HOD/LOD.
-    Tolerance 0.12% ≈ 25pt at 21k — a zone that close to HOD/LOD is a real hit.
+    whether any zone is within tolerance_pts of that day's actual HOD/LOD.
     """
     rng = np.random.default_rng(seed)
     df2 = df.copy()
@@ -555,7 +554,7 @@ def hod_lod_coverage(df: pd.DataFrame, n_days: int = 60,
     hod_hits = lod_hits = both_hits = total = 0
     rows = []
     sep = "-" * 68
-    print(f"\n  HOD/LOD coverage  ({len(sample)} days, tol={tolerance_pct*100:.2f}% of price)")
+    print(f"\n  HOD/LOD coverage  ({len(sample)} days, tol=±{tolerance_pts:.0f}pts fixed)")
     print(sep)
     print(f"  {'DATE':<12}  {'HOD':>8}  {'LOD':>8}  {'dHOD':>6}  {'dLOD':>6}  HOD  LOD")
     print(sep)
@@ -573,7 +572,7 @@ def hod_lod_coverage(df: pd.DataFrame, n_days: int = 60,
         zp   = np.array([z.price for z in zones])
         hod  = float(day_stats.loc[day, "hod"])
         lod  = float(day_stats.loc[day, "lod"])
-        tol  = ((hod + lod) / 2) * tolerance_pct
+        tol  = tolerance_pts
 
         hod_dist = float(np.min(np.abs(zp - hod)))
         lod_dist = float(np.min(np.abs(zp - lod)))
@@ -1074,7 +1073,7 @@ def _baseline_rate(df: pd.DataFrame, n_samples: int, tolerance: float,
 
 def print_backtest_report(df: pd.DataFrame, bt: pd.DataFrame,
                           reversal_pct: float = 0.0035,
-                          tolerance: float = BIN_SIZE,
+                          tolerance: float = 15.0,
                           forward_bars: int = 390,
                           min_sep_bars: int = 240):
     pct_str  = f"{reversal_pct*100:.2f}%"

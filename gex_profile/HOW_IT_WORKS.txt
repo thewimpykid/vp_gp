@@ -1,0 +1,504 @@
+================================================================================
+  NQ 0DTE GEX PROFILE — HOW IT WORKS
+  gex_profile / gex_profile.py
+  Last updated: 2026-06-10
+================================================================================
+
+This system identifies high-probability reversal zones on NQ futures (Nasdaq-100
+E-mini) using stacked 0-DTE Gamma Exposure profiles from the 5 prior trading
+sessions, combined with the same structural levels used by stacked_vp. Zero
+look-ahead — all inputs are strictly prior data. Zones computed before market
+open reflect only what a live trader would have known that morning.
+
+--------------------------------------------------------------------------------
+  1. WHAT IS GEX AND WHY DOES IT MATTER FOR NQ?
+--------------------------------------------------------------------------------
+
+Gamma Exposure (GEX) measures how much delta-hedging activity a market maker
+must do as the underlying moves. When NQ moves through a price level where many
+0DTE options are struck, dealers must rapidly buy or sell futures to stay
+delta-neutral. This forced hedging creates predictable order flow:
+
+  Positive GEX zone (large gamma): dealers buy when price falls, sell when
+    price rises. Price gets "pinned" — the zone acts as a magnet and absorber.
+
+  Negative GEX zone (low gamma): dealers amplify moves — buy when price rises,
+    sell when price falls. Price accelerates through these zones.
+
+0DTE options (expiring same day) have the highest gamma of all contracts:
+gamma spikes dramatically near ATM and collapses to near-zero more than ~2σ
+away. This means 0DTE GEX is tightly concentrated around the prior session's
+close, not spread across a wide range. The concentration is what makes 0DTE GEX
+useful — it pins highly specific price levels rather than creating vague ranges.
+
+NQ specifically: NQ has much higher implied volatility than SPX per index point
+(σ_NQ ≈ VIX × 1.15), so the 0DTE gamma bell is wider in absolute points but
+still tightly centered. At VIX=18, σ_daily ≈ 287 points. Levels within ±1σ
+(~287 pts) of the prior close carry most of the 0DTE gamma weight.
+
+--------------------------------------------------------------------------------
+  2. DATA AND INPUTS
+--------------------------------------------------------------------------------
+
+NQ 1-minute OHLCV: 1Min_NQ.csv — Sierra Chart export, 2014–2026, 4.17M bars.
+  Format: semicolon-separated, European notation (3.575,75 = 3575.75).
+  Cache: parsed to Parquet on first load for fast subsequent reads (<1s).
+
+VIX daily: fetched from Yahoo Finance (^VIX), cached to vix_daily.parquet.
+  Used to set σ_NQ for each session's gamma kernel.
+  NQ_IV_MULT = 1.15: NQ implied vol ≈ VIX × 1.15 (empirical constant).
+  If VIX is unavailable for a date, default σ = 20.0 (VIX=20 assumed).
+
+Working range: 2020–2026. Pre-2020 excluded to match current volatility regime.
+
+--------------------------------------------------------------------------------
+  3. THE 0DTE GAMMA KERNEL
+--------------------------------------------------------------------------------
+
+For each prior session, the system computes a GEX-weighted volume profile.
+The core transform is:
+
+  GEX(K) = VP_volume(K) × Γ_BS(S, K, T=1/252, σ_NQ)
+
+Where:
+  VP_volume(K) = volume traded at strike/price K during that session
+                 (OHLCV approximation: volume uniformly distributed across
+                  all 5-point bins spanning each bar's [Low, High])
+  Γ_BS         = Black-Scholes gamma at T = 1 trading day (1/252 years)
+  S            = that session's closing price (spot price)
+  K            = each 5-point price bin
+  σ_NQ         = that session's implied volatility (VIX × 1.15 / 100)
+
+Black-Scholes gamma formula:
+  d1 = [ln(S/K) + (r + 0.5σ²)T] / (σ√T)
+  Γ  = N'(d1) / (S × σ × √T)
+  where N'(d1) = standard normal PDF at d1
+
+T = 1/252 means this models options with exactly 1 trading day to expiry.
+At T=1/252 gamma is extremely peaked near ATM and decays fast:
+
+  At NQ=22000, VIX=18 (σ_NQ=0.207), σ_daily = 22000×0.207/√252 ≈ 287 pts:
+    K = 22000 (ATM)        → gamma near maximum
+    K = 21713 or 22287     → gamma ≈ 60% of ATM (1σ away)
+    K = 21426 or 22574     → gamma ≈ 13% of ATM (2σ away)
+    K = 21139 or 22861     → gamma ≈ 0.3% of ATM (3σ away)
+
+Effect: the GEX profile has a tight bell centered on the session close. Only
+levels within ~2σ_daily of the prior close carry meaningful GEX weight. This
+automatically focuses the analysis on the relevant price range for the next day.
+
+Rescaling: GEX_raw is renormalized so its peak matches the raw VP peak volume.
+This keeps GEX values on the same scale regardless of σ or S, allowing
+consistent HVN/LVN detection thresholds across different vol regimes.
+
+Fallback: if the gamma kernel produces a degenerate result (near-zero sum),
+the raw VP is used directly. This handles edge cases like VIX spikes.
+
+--------------------------------------------------------------------------------
+  4. PER-SESSION FEATURE DETECTION
+--------------------------------------------------------------------------------
+
+Each session's GEX profile (bins, gex_vols) is analyzed with Savitzky-Golay
+smoothing (polyorder=2, window=max(5, n_bins//15)) before peak detection.
+Smoothing prevents noise peaks in the GEX curve from generating spurious levels.
+
+4a. VAH / VAL — GEX Value Area High / Low
+    Weight: 1.2 each
+    The price range containing 70% of total GEX weight (VALUE_AREA_PCT = 0.70).
+    Built greedily: repeatedly add the highest-GEX bin until 70% is accumulated.
+    VAH = top of the highest-included bin. VAL = bottom of the lowest.
+    Interpretation: where 70% of the day's 0DTE hedging pressure was concentrated.
+    Price outside the GEX value area tends to get rejected back toward it —
+    the same mean-reversion logic as volume profile VA, but gamma-weighted.
+
+4b. POC — GEX Point of Control
+    Weight: 1.1
+    The 5-point bin with the highest GEX weight. The "gamma-weighted fair value"
+    for that session — where dealer hedging was most intensive. Price gravitates
+    toward the POC during consolidating sessions.
+
+4c. HVN boundaries — Shelf / Ledge
+    Detection: scipy.signal.find_peaks on smoothed GEX, prominence ≥ 30% of peak.
+    For each peak, half-width boundaries are extracted (at rel_height=0.5).
+    Each boundary is classified by its local slope over 5 bins:
+
+    Shelf (weight 0.8): avg |Δgex| / peak ≤ 0.08 — gradual taper.
+      The GEX bell-curve shoulder. Price decelerates here; less sharp than ledge.
+      INCLUDE_SHELF = True (unlike VP where shelf was disabled — GEX bell curves
+      produce more meaningful shoulders than volume profile shelves do).
+
+    Ledge (weight 1.3): avg |Δgex| / peak ≥ 0.20 — abrupt cliff.
+      The sharpest boundary of a GEX peak. Strongest 0DTE barrier —
+      dealers face the most abrupt hedging requirement change at ledge transitions.
+      INCLUDE_LEDGE = True.
+
+4d. LVN — Low Volume GEX Node
+    Weight: 0.9
+    Valleys in the smoothed GEX where value < 40% of mean GEX (LVN_DEPTH = 0.40).
+    Low-GEX zones = thin dealer interest = fast travel or reversal magnet when
+    approached from the other side. Same logic as VP LVN, applied to GEX.
+
+4e. GWall — Gamma Wall (GEX-specific, not in VP)
+    Weight: 1.1
+    Peaks in |dGEX/dK| — where the GEX gradient is steepest.
+    Detection: find_peaks on abs(gradient), prominence ≥ 25% of max abs-gradient,
+    minimum distance = max(3, n_bins//20), smoothed GEX at peak ≥ 15% of peak.
+    The top 3 prominent gradient peaks are taken per session.
+
+    Why it matters: where GEX changes fastest with price, dealer delta-hedging
+    activity changes most abruptly. A GWall is a price boundary where market
+    maker behavior flips fastest — the strongest mechanical resistance/support
+    in the 0DTE framework. Compared to a ledge (shape-based), a gwall is
+    gradient-based — captures the same steep-slope concept differently.
+
+    Confirmed to appear in 90%+ of sessions in recent NQ data.
+
+4f. GFlip — Gamma Flip / Inflection Point (GEX-specific, not in VP)
+    Weight: 1.3
+    Inflection points of the GEX curve: where d²GEX/dK² changes sign.
+    Detection: sign changes in second derivative of smooth GEX, filtered to
+    candidates where local GEX ≥ 20% of peak AND local gradient is non-trivial.
+    Top 2 strongest candidates taken per session (ranked by gex × |grad|).
+
+    Why it matters: at an inflection point, the dealer's gamma curve transitions
+    from accelerating to decelerating (or vice versa). This is where 0DTE dealer
+    behavior switches mode — from aggressive hedging to passive. In practice,
+    gflip levels often align with GEX peaks or with the transition between the
+    positive-gamma and near-zero-gamma zones.
+
+    Weight 1.3 matches ledge and pdh — high conviction because it identifies
+    a regime change in dealer mechanics, not just a level of activity.
+
+--------------------------------------------------------------------------------
+  5. FIVE-SESSION STACKING
+--------------------------------------------------------------------------------
+
+The last N_SESSIONS = 5 prior completed sessions are processed independently.
+Each session gets a unique timeframe ID: "0dte_d-1" (most recent) through
+"0dte_d-5" (oldest). "d-1" = yesterday's session.
+
+Why 5 sessions?
+  One session = current GEX snapshot. Possibly random, possibly meaningful.
+  Three sessions agreeing = structural. The same level was important to 0DTE
+  dealers on three separate days — that's not noise.
+  Five sessions = ~1 full calendar week. Captures the standard options week
+  (Mon–Fri 0DTE cycle). Levels that persist across the full week have held up
+  through different vol conditions and underlying price moves.
+
+  Scoring by n_tf²:
+    1 session: score × 1² = 1.0× boost
+    2 sessions: score × 2² = 4.0× boost
+    3 sessions: score × 3² = 9.0× boost
+    4 sessions: score × 4² = 16.0× boost
+    5 sessions: score × 5² = 25.0× boost
+
+  A level that appears in all 5 prior 0DTE profiles is 25× more confident
+  than one that appeared only yesterday. These "sticky" GEX levels represent
+  price ranges where dealer books have been consistently active — the deepest
+  liquidity pockets in the nearby range.
+
+Only completed sessions are used. The current (possibly partial) session is
+excluded. This is critical for zero look-ahead compliance.
+
+--------------------------------------------------------------------------------
+  6. STRUCTURAL LEVELS (SHARED WITH STACKED_VP)
+--------------------------------------------------------------------------------
+
+The same structural levels as stacked_vp are added to the GEX feature pool.
+These are calendar/session-derived price boundaries, independent of VP or GEX:
+
+  PDH / PDL  — Prior Day High/Low (last 10 days)       weight 1.4
+  IBH / IBL  — Initial Balance High/Low (last 3 days)  weight 1.6
+  ONH / ONL  — Overnight High/Low (last 3 days)        weight 1.2
+  Gap        — Prior RTH close (last 3 days)            weight 1.1
+  PWH / PWL  — Prior Week High/Low                     weight 1.2
+  PMH / PML  — Prior Month High/Low                    weight 1.3
+  Round      — 500pt psychological levels               weight 1.5
+  Round      — 100pt psychological levels               weight 1.0
+
+Per-day timeframe IDs (d-1, d-2, d-3…) apply to PDH/PDL, IBH/IBL, ONH/ONL,
+and gap, just as in stacked_vp. This means three days making their high near
+the same price gives three separate timeframes, boosting n_tf and score.
+
+IBH/IBL carry the highest weight (1.6) because they backtested with the
+strongest solo reversal rate in NQ. The Initial Balance first hour (09:30–10:30
+ET) is the most-watched intraday reference in Market Profile theory.
+
+PMH/PML require a fully completed prior calendar month — no partial months.
+RTH close (gap level) uses the last bar in the 09:30–16:15 ET window only —
+not the overnight close — to avoid leaking pre-market data into the RTH gap.
+
+Round numbers are generated within ±4 × ATR20 of current price. ATR20 is
+computed from the last 20 daily bars (true range, not just H-L).
+
+--------------------------------------------------------------------------------
+  7. CONFLUENCE STACKING (THE CORE LOGIC)
+--------------------------------------------------------------------------------
+
+All features from all 5 GEX sessions + all structural levels are pooled.
+The stacking algorithm identifies price clusters where multiple independent
+sources agree — the "weight of evidence" principle.
+
+Stacking algorithm (greedy clustering):
+
+  1. Sort all features by price ascending.
+  2. Scan left to right. For each unassigned feature, grab all others within
+     ±tolerance. Tolerance = STACK_TOLERANCE × BIN_SIZE = 3.0 × 5.0 = 15 pts.
+  3. All grabbed features form one cluster. Cluster price = mean of member prices.
+  4. Count unique timeframes (n_tf). Features from the same timeframe count as 1.
+  5. Score = n_tf² × Σ(feature weights)
+
+The n_tf² exponent rewards multi-source alignment exponentially:
+
+  Single source (1 TF), weight sum 4.0  → score = 1 × 4.0 =  4.0
+  Two sources   (2 TF), weight sum 4.0  → score = 4 × 4.0 = 16.0
+  Three sources (3 TF), weight sum 4.0  → score = 9 × 4.0 = 36.0
+  Five sources  (5 TF), weight sum 4.0  → score = 25 × 4.0 = 100.0
+
+Typical zone scores range from ~8 (single-TF structural) to 120+ (multi-session
+GEX + structural confluence).
+
+What makes a GEX zone different from a VP zone: a high-scoring GEX zone requires
+the same price level to be mechanically important to 0DTE dealer books across
+multiple sessions. This is not just "volume was here" but "dealers were forced
+to hedge near this price, repeatedly." VP and GEX frequently agree on levels —
+when they do, the combined confidence is highest (see combined_analyzer.py).
+
+--------------------------------------------------------------------------------
+  8. DAILY ZONE SELECTION
+--------------------------------------------------------------------------------
+
+From all scored zones, 5 are selected for display, using the same logic as VP:
+
+  Step 1: Filter to n_tf ≥ 2 (drop single-source noise). Fallback to all zones
+          if fewer than 4 survive.
+  Step 2: Expand ATR multiplier from ±2.0 to ±5.0 (step 0.5) until ≥ 5 qualify.
+  Step 3: Balance above/below current close (3 above, 2 below; fill from other
+          side if one side is short).
+  Step 4: Sort by price ascending.
+
+ATR20 is used as the range window so the selection automatically scales to
+NQ's current vol regime — in a 150-pt-ATR regime fewer zones qualify in a narrow
+band; in a 350-pt-ATR regime the ±2 ATR window already captures plenty.
+
+On the console output:
+  "0DTE_SESS" = how many of the 5 prior sessions contributed to the zone.
+  "[0dte_d-1|0dte_d-3]" = which specific sessions contributed.
+  Zones showing 3+ 0DTE sessions are the highest-conviction GEX levels.
+
+On charts:
+  Zone bands centered on zone.price, band half-width = price × 0.0005 (~11 pts).
+  Color: cyan gradient, darker = higher score.
+  Dashed line at zone center.
+  Label: price, [R/S] role, feature types, n_tf, 0DTE session count.
+  Gold dotted lines: actual HOD/LOD (post-hoc reference only, not used in logic).
+
+--------------------------------------------------------------------------------
+  9. FEATURE TYPE WEIGHTS SUMMARY
+--------------------------------------------------------------------------------
+
+Feature type        Weight   Source
+------------------------------------------------------------------------
+ibh / ibl           1.6      Initial Balance H/L — strongest intraday level
+pdh / pdl           1.4      Prior Day H/L — most-watched NQ level
+gflip               1.3      GEX inflection — dealer mode change
+ledge               1.3      Abrupt GEX HVN boundary
+pmh / pml           1.3      Prior Month H/L — macro reference
+vah / val           1.2      70% GEX value area boundaries
+onh / onl           1.2      Overnight H/L
+pwh / pwl           1.2      Prior Week H/L
+gwall               1.1      Steepest |dGEX/dK| — fastest dealer response
+poc                 1.1      Highest-GEX bin — gamma-weighted fair value
+gap                 1.1      Prior RTH close (gap fill reference)
+round (500pt)       1.5      500pt psychological levels
+round (100pt)       1.0      100pt psychological levels
+shelf               0.8      Gradual GEX HVN boundary
+lvn                 0.9      Low-GEX thin zone
+
+Final zone score = n_tf² × Σ(weights of all member features)
+
+Example — a zone at 21500 with:
+  0dte_d-1 ledge (1.3) + 0dte_d-2 gflip (1.3) + 0dte_d-3 gwall (1.1) +
+  d-1 IBH (1.6) + psychological round 500pt (1.5)
+  → 5 unique timeframes (0dte_d-1, 0dte_d-2, 0dte_d-3, d-1, psychological)
+  → weight sum = 1.3 + 1.3 + 1.1 + 1.6 + 1.5 = 6.8
+  → score = 5² × 6.8 = 25 × 6.8 = 170.0 — extremely high confidence
+
+--------------------------------------------------------------------------------
+  10. VIX DEPENDENCY AND REGIME SENSITIVITY
+--------------------------------------------------------------------------------
+
+The gamma kernel's width is directly controlled by VIX × 1.15 / 100 = σ_NQ.
+
+Low VIX (e.g. VIX=12, σ_NQ=0.138):
+  σ_daily ≈ 22000 × 0.138 / √252 ≈ 191 pts
+  The gamma bell is tighter. Only levels within ~380 pts of the prior close
+  get meaningful GEX weight. Zones are more concentrated, closer to price.
+
+High VIX (e.g. VIX=30, σ_NQ=0.345):
+  σ_daily ≈ 22000 × 0.345 / √252 ≈ 478 pts
+  The gamma bell widens. More of the price range gets GEX weight.
+  Zones spread further from price. POC/VAH/VAL shift away from ATM.
+
+This automatic VIX-scaling is the key advantage of the GEX approach over
+raw VP: the system knows how wide dealer gamma coverage is on any given day.
+During a VIX spike to 50 (e.g. Aug 2024 crash), the gamma bell becomes so
+wide that GEX is nearly flat — correctly signaling "no reliable pin levels
+today." Raw VP would still produce levels that don't carry gamma meaning.
+
+AVG VIX used in reporting is the mean across the 5 prior sessions. If avg VIX
+at time of analysis differs significantly from the session-specific VIX values
+stored in each GEX profile, the zone's effective radius may be wider or narrower
+than it was when that level was originally formed.
+
+--------------------------------------------------------------------------------
+  11. NO LOOK-AHEAD ENFORCEMENT
+--------------------------------------------------------------------------------
+
+Every sample-day chart and every HOD/LOD coverage test uses strict walk-forward:
+
+  df_prior  = all bars with date < target_day
+  df_window = df_prior.tail(30_000)   # ~76 trading days
+
+  run(df_window, vix_series) → zones
+
+The VIX lookup uses vix_series[index <= as_of_date - 1 day] — prior day's VIX
+only. The day_vix for session d-1 uses the VIX as of that session's date, which
+was already in the past relative to the target day.
+
+No data from the target day or any future day enters the GEX computation.
+The 30,000-bar tail comfortably covers 5 full prior sessions
+(5 × 390 bars = 1,950 bars needed) plus all structural level lookbacks.
+
+--------------------------------------------------------------------------------
+  12. HOD/LOD COVERAGE VALIDATION
+--------------------------------------------------------------------------------
+
+Method: identical to stacked_vp. For each test day (walk-forward, no sampling):
+  1. Compute zones from strictly prior data.
+  2. Find minimum distance from any zone to the day's actual HOD and LOD.
+  3. Hit if distance ≤ 15 points (fixed, ±15pt band = 30pt zone width).
+
+Results (2024+2025, all eligible days, ±15pt tolerance):
+  2024: HOD 65.5%  LOD 73.5%  Both 48.6%  (n=313 days)
+  2025: HOD 62.4%  LOD 70.1%  Both 43.1%  (n=311 days)
+  Combined: HOD 63.9%  LOD 71.8%  Both 45.8%  (n=624 days)
+  Avg distance to zone (combined): HOD 14.8 pts, LOD 12.8 pts
+
+LOD capture (71.8%) is consistently higher than HOD (63.9%). Interpretation:
+GEX downside levels (dealer support near prior session lows, IB lows) are more
+structurally stable than upside levels, possibly because NQ selloffs are sharper
+and more decisive about stopping at gamma-support, while breakouts are more
+gradual and overshoot GEX resistance levels before reversing.
+
+Miss rate (~36% HOD, ~28% LOD) is concentrated on:
+  a) Trend days: price breaks far from all prior structure. Correct behavior.
+  b) Gap-and-go opens that exceed the prior week's range entirely.
+  c) VIX spike days where the gamma bell was too wide to pin any level.
+  d) Low-volume sessions (holidays, half-days) with compressed ranges.
+
+--------------------------------------------------------------------------------
+  13. COMPARISON WITH VP (STACKED_VP)
+--------------------------------------------------------------------------------
+
+GEX outperforms VP on HOD/LOD coverage by ~+5% HOD, +6-7% LOD (2024+2025).
+
+Why GEX often beats VP:
+  - VP captures where volume was. GEX captures where dealer hedging was forced.
+    In NQ, institutional flow creates volume at GEX levels precisely because
+    dealers are printing large orders at those strikes.
+  - 0DTE gamma is tightly time-bounded. VP windows (30/60/90d) can include
+    irrelevant old structure. 5-session GEX stays current.
+  - GWall and GFlip have no VP equivalent. They identify mechanistic dealer
+    response points that VP cannot see.
+  - VIX-scaling automatically filters noise when vol is high.
+
+Where VP has advantages:
+  - Longer historical structure (90d POC, quarterly value area) not in GEX.
+  - Better for slow-moving structural support many weeks old.
+  - Does not require VIX data.
+
+Combined system (combined_vp_gex) gets marginal HOD/LOD improvement over GEX
+alone (+0-1%), suggesting GEX already captures most of the zone structure, and
+VP adds mostly redundant levels where they agree.
+
+--------------------------------------------------------------------------------
+  14. WHAT THE SYSTEM IS NOT
+--------------------------------------------------------------------------------
+
+Not a mechanical buy/sell signal. Zones mark elevated reversal probability
+vs. a random price level — not guaranteed reversals. Require additional
+triggers (pattern, delta, tape) before entry.
+
+Not calibrated for low-VIX trending markets. If NQ's daily ATR compresses
+below ~150 pts sustained, the 5-session GEX stack will still produce zones
+but their predictive value degrades (fewer forced-hedge situations).
+
+Not a substitute for reading the tape. GEX zones tell you where dealers have
+been. Where they will be tomorrow depends partly on overnight news, macro events,
+and options positioning data (actual OI by strike) that this system does not use.
+
+Not designed for pre-2020 data. Pre-2018 NQ volatility (~100 pt ATR) means the
+20-point gamma band at T=1/252 was proportionally much wider, making per-session
+GEX bells too diffuse to distinguish levels. Use 2020+ only.
+
+--------------------------------------------------------------------------------
+  15. PERFORMANCE CHARACTERISTICS
+--------------------------------------------------------------------------------
+
+Compute time:
+  First run (parquet build): ~30 seconds
+  Subsequent runs:            <3 seconds (parquet load)
+  Per-day in walk-forward:    ~0.4s per day (5 GEX sessions + structural)
+  Annual full coverage run:   ~2 minutes (250+ days, no parallelism)
+
+Memory:
+  Full 4M-bar DataFrame: ~400 MB
+  30k-bar window:         ~3 MB
+  5 GEX profiles:         ~1 MB total
+
+Files:
+  gex_profile.py              — main script
+  compare_vp_gex.py           — VP vs GEX HOD/LOD head-to-head
+  run_2024_2025.py            — generate 30 GEX sample charts
+  hdata/NQ_1m_cache.parquet   — cached NQ 1m data
+  hdata/vix_daily.parquet     — cached VIX daily series
+  gex_backtest.csv            — per-zone reversal backtest results
+  hod_lod_coverage.csv        — per-day HOD/LOD hit/miss table
+  gex_YYYY-MM-DD.png          — sample day charts
+
+--------------------------------------------------------------------------------
+  16. COMMAND REFERENCE
+--------------------------------------------------------------------------------
+
+# Daily levels (what to trade today):
+python gex_profile.py
+
+# 15 no-look-ahead sample charts (random dates):
+python gex_profile.py --sample-days 15
+
+# 3-year reversal backtest:
+python gex_profile.py --backtest
+
+# HOD/LOD walk-forward coverage (60 sampled days):
+python gex_profile.py --hod-lod
+
+# Full HOD/LOD over all days in a date range:
+python gex_profile.py --hod-lod-full --start 2024-01-01 --end 2024-12-31
+
+# Raw GEX curve plots for each of the 5 sessions:
+python gex_profile.py --curves
+
+# GEX parameter optimization sweep:
+python gex_profile.py --optimize
+
+# VP vs GEX HOD/LOD head-to-head (2024 + 2025):
+python compare_vp_gex.py
+
+# GEX only, single year:
+python compare_vp_gex.py --no-vp --year 2025
+
+# Generate 30 GEX charts from 2024/2025:
+python run_2024_2025.py
+
+================================================================================

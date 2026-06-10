@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore")
 # ─── VP coverage runner ───────────────────────────────────────────────────────
 
 def _vp_coverage(df_full: pd.DataFrame, start: str, end: str,
-                 tol_pct: float = 0.0012, bin_size: float = 5.0) -> dict:
+                 tolerance_pts: float = 15.0, bin_size: float = 5.0) -> dict:
     """Walk-forward VP HOD/LOD on all eligible days in [start, end]."""
     from stacked_vp import run as vp_run
 
@@ -62,7 +62,7 @@ def _vp_coverage(df_full: pd.DataFrame, start: str, end: str,
         zp      = np.array([z.price for z in zones])
         hod     = float(day_stats.loc[day, "hod"])
         lod     = float(day_stats.loc[day, "lod"])
-        tol     = ((hod + lod) / 2) * tol_pct
+        tol     = tolerance_pts
         hd      = float(np.min(np.abs(zp - hod)))
         ld      = float(np.min(np.abs(zp - lod)))
         hod_hit = hd <= tol
@@ -91,7 +91,7 @@ def _vp_coverage(df_full: pd.DataFrame, start: str, end: str,
 
 def _gex_coverage(df_full: pd.DataFrame, vix_series: pd.Series,
                   start: str, end: str,
-                  tol_pct: float = 0.0012, bin_size: float = 5.0) -> dict:
+                  tolerance_pts: float = 15.0, bin_size: float = 5.0) -> dict:
     """Walk-forward GEX HOD/LOD on all eligible days in [start, end]."""
     from gex_profile import run as gex_run
 
@@ -124,7 +124,7 @@ def _gex_coverage(df_full: pd.DataFrame, vix_series: pd.Series,
         zp      = np.array([z.price for z in zones])
         hod     = float(day_stats.loc[day, "hod"])
         lod     = float(day_stats.loc[day, "lod"])
-        tol     = ((hod + lod) / 2) * tol_pct
+        tol     = tolerance_pts
         hd      = float(np.min(np.abs(zp - hod)))
         ld      = float(np.min(np.abs(zp - lod)))
         hod_hit = hd <= tol
@@ -184,8 +184,8 @@ def main():
     parser.add_argument("--no-gex", action="store_true")
     parser.add_argument("--year",   type=str, default=None,
                         help="Single year to test (e.g. 2024). Default: 2024 + 2025")
-    parser.add_argument("--tol",    type=float, default=0.0012,
-                        help="Tolerance as fraction of mid-price (default 0.0012 = 0.12%%)")
+    parser.add_argument("--tol",    type=float, default=15.0,
+                        help="Tolerance in points on each side (default 15 pts)")
     args = parser.parse_args()
 
     print("=" * 56)
@@ -211,12 +211,12 @@ def main():
         vp_r = {}
         if not args.no_vp:
             print(f"\n  Running VP ({yr})...")
-            vp_r = _vp_coverage(vp_df, start, end, tol_pct=args.tol)
+            vp_r = _vp_coverage(vp_df, start, end, tolerance_pts=args.tol)
 
         gex_r = {}
         if not args.no_gex:
             print(f"\n  Running GEX ({yr})...")
-            gex_r = _gex_coverage(gex_df, vix, start, end, tol_pct=args.tol)
+            gex_r = _gex_coverage(gex_df, vix, start, end, tolerance_pts=args.tol)
 
         results[yr] = {"vp": vp_r, "gex": gex_r}
         print_comparison(yr, vp_r, gex_r)
