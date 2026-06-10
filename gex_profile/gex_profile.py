@@ -90,6 +90,8 @@ GFLIP_MIN_GEX     = 0.20
 NQ_IV_MULT        = 1.15   # NQ IV ≈ VIX × 1.15
 INCLUDE_SHELF     = True
 INCLUDE_LEDGE     = True
+USE_GWALL         = True
+USE_GFLIP         = True
 N_SESSIONS        = 5      # prior sessions for 0DTE stack (1 calendar week)
 MINS_PER_DAY      = 390
 T_0DTE            = 1.0 / 252.0   # 0DTE = 1 trading day in years
@@ -393,7 +395,7 @@ def detect_gex_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
     abs_grad = np.abs(grad)
     ag_max   = abs_grad.max()
 
-    if ag_max > 1e-12:
+    if USE_GWALL and ag_max > 1e-12:
         wall_peaks, props = find_peaks(
             abs_grad, prominence=GWALL_PROMINENCE * ag_max,
             distance=max(3, n // 20)
@@ -406,17 +408,18 @@ def detect_gex_features(vp: VolumeProfile, bin_size: float = BIN_SIZE) -> list:
                 if smooth[p] >= 0.15 * peak_vol:
                     feats.append(VPFeature(float(bins[p]), "gwall", tf, weight=1.1))
 
-    d2      = np.gradient(grad, bin_size)
-    sign_ch = np.where(np.diff(np.sign(d2)))[0]
-    cands   = []
-    for i in sign_ch:
-        local_gex  = float(smooth[i])
-        local_grad = float(abs_grad[i])
-        if local_gex >= GFLIP_MIN_GEX * peak_vol:
-            cands.append((local_gex * local_grad, i))
-    cands.sort(reverse=True)
-    for _, i in cands[:2]:
-        feats.append(VPFeature(float(bins[i]), "gflip", tf, weight=1.3))
+    if USE_GFLIP:
+        d2      = np.gradient(grad, bin_size)
+        sign_ch = np.where(np.diff(np.sign(d2)))[0]
+        cands   = []
+        for i in sign_ch:
+            local_gex  = float(smooth[i])
+            local_grad = float(abs_grad[i])
+            if local_gex >= GFLIP_MIN_GEX * peak_vol:
+                cands.append((local_gex * local_grad, i))
+        cands.sort(reverse=True)
+        for _, i in cands[:2]:
+            feats.append(VPFeature(float(bins[i]), "gflip", tf, weight=1.3))
 
     return feats
 
@@ -1134,21 +1137,254 @@ def plot_sample_days(df: pd.DataFrame, vix_series: pd.Series,
     print(f"  Done.  ({generated}/{n} charts)")
 
 
+# ─── Optimization & Full Coverage ────────────────────────────────────────────
+
+def _apply_cfg(cfg: dict) -> dict:
+    """Temporarily override module-level constants. Returns originals for restore."""
+    import sys as _sys
+    mod = _sys.modules[__name__]
+    originals = {}
+    for k, v in cfg.items():
+        if hasattr(mod, k):
+            originals[k] = getattr(mod, k)
+            setattr(mod, k, v)
+    return originals
+
+
+def _restore_cfg(originals: dict):
+    import sys as _sys
+    mod = _sys.modules[__name__]
+    for k, v in originals.items():
+        setattr(mod, k, v)
+
+
+def _fast_hod_lod(df: pd.DataFrame, vix_series: pd.Series,
+                  days_list: list, bin_size: float = BIN_SIZE,
+                  tol_pct: float = 0.0012) -> dict:
+    """Quiet HOD/LOD test on a fixed day list. Returns stats dict."""
+    df2 = df.copy()
+    df2["_day"] = df2["date"].dt.date
+    day_stats = df2.groupby("_day").agg(
+        bars=("close", "count"), hod=("high", "max"), lod=("low", "min"),
+    )
+    hod_hits = lod_hits = both_hits = total = 0
+    hod_dists: list[float] = []
+    lod_dists: list[float] = []
+
+    for day in days_list:
+        if day not in day_stats.index:
+            continue
+        df_prior  = df2[df2["_day"] < day]
+        df_window = df_prior.tail(30_000).copy()
+        if len(df_window) < 500:
+            continue
+        zones, _, _ = run(df_window, vix_series, bin_size=bin_size, quiet=True)
+        if not zones:
+            continue
+        zp      = np.array([z.price for z in zones])
+        hod     = float(day_stats.loc[day, "hod"])
+        lod     = float(day_stats.loc[day, "lod"])
+        tol     = ((hod + lod) / 2) * tol_pct
+        hd      = float(np.min(np.abs(zp - hod)))
+        ld      = float(np.min(np.abs(zp - lod)))
+        hod_hit = hd <= tol
+        lod_hit = ld <= tol
+        if hod_hit: hod_hits += 1
+        if lod_hit: lod_hits += 1
+        if hod_hit and lod_hit: both_hits += 1
+        total += 1
+        hod_dists.append(hd)
+        lod_dists.append(ld)
+
+    if total == 0:
+        return {"hod_rate": 0.0, "lod_rate": 0.0, "both_rate": 0.0,
+                "avg_hod_dist": 999.0, "avg_lod_dist": 999.0, "n_days": 0}
+    return {
+        "hod_rate":     hod_hits / total,
+        "lod_rate":     lod_hits / total,
+        "both_rate":    both_hits / total,
+        "avg_hod_dist": float(np.mean(hod_dists)),
+        "avg_lod_dist": float(np.mean(lod_dists)),
+        "n_days":       total,
+    }
+
+
+def optimize_gex(df: pd.DataFrame, vix_series: pd.Series,
+                 n_sample: int = 40, seed: int = 42,
+                 bin_size: float = BIN_SIZE) -> tuple:
+    """
+    Greedy single-parameter sweep to maximize HOD+LOD+Both coverage.
+    Each parameter swept independently; best value locked before next sweep.
+    Uses a fixed random sample of n_sample days (reproducible via seed).
+    """
+    rng = np.random.default_rng(seed)
+    df2 = df.copy()
+    df2["_day"] = df2["date"].dt.date
+    day_stats   = df2.groupby("_day").agg(bars=("close", "count"))
+    all_days    = sorted(day_stats.index.tolist())
+    eligible    = [d for d in all_days
+                   if day_stats.loc[d, "bars"] >= 300
+                   and all_days.index(d) >= 10]
+    sample = sorted(rng.choice(eligible,
+                               size=min(n_sample, len(eligible)),
+                               replace=False).tolist())
+
+    print(f"\n  Optimization: {len(sample)} sample days  seed={seed}")
+    print(f"  Range: {sample[0]} → {sample[-1]}")
+
+    def _score(r): return r["hod_rate"] + r["lod_rate"] + r["both_rate"] * 0.5
+
+    base  = _fast_hod_lod(df, vix_series, sample, bin_size)
+    print(f"\n  Baseline  HOD={base['hod_rate']:.1%}  LOD={base['lod_rate']:.1%}  "
+          f"Both={base['both_rate']:.1%}  score={_score(base):.3f}\n")
+
+    best_cfg   = {}
+    best_score = _score(base)
+
+    sweeps = [
+        ("N_SESSIONS",       [3, 4, 5, 6, 7]),
+        ("STACK_TOLERANCE",  [1.5, 2.0, 2.5, 3.0, 3.5, 4.0]),
+        ("HVN_PROMINENCE",   [0.15, 0.20, 0.25, 0.30, 0.35, 0.40]),
+        ("LVN_DEPTH",        [0.25, 0.30, 0.35, 0.40, 0.45, 0.50]),
+        ("INCLUDE_SHELF",    [True, False]),
+        ("INCLUDE_LEDGE",    [True, False]),
+        ("USE_GWALL",        [True, False]),
+        ("USE_GFLIP",        [True, False]),
+        ("GWALL_PROMINENCE", [0.10, 0.15, 0.20, 0.25, 0.30, 0.35]),
+    ]
+
+    for param, values in sweeps:
+        print(f"  ─ {param}")
+        phase_best_val   = None
+        phase_best_score = best_score
+
+        for val in values:
+            cfg  = {**best_cfg, param: val}
+            orig = _apply_cfg(cfg)
+            try:
+                res = _fast_hod_lod(df, vix_series, sample, bin_size)
+                s   = _score(res)
+                mark = " ◄" if s > phase_best_score else ""
+                print(f"    {str(val):<8}  HOD={res['hod_rate']:.1%}  "
+                      f"LOD={res['lod_rate']:.1%}  Both={res['both_rate']:.1%}  "
+                      f"score={s:.3f}{mark}")
+                if s > phase_best_score:
+                    phase_best_score = s
+                    phase_best_val   = val
+            finally:
+                _restore_cfg(orig)
+
+        if phase_best_val is not None and phase_best_val != {**best_cfg}.get(param):
+            best_cfg[param]  = phase_best_val
+            best_score       = phase_best_score
+            print(f"  → updated: {param} = {phase_best_val!r}  score={best_score:.3f}")
+
+    print(f"\n  ══════ OPTIMAL CONFIG ══════")
+    for k, v in best_cfg.items():
+        print(f"    {k} = {v!r}")
+
+    orig = _apply_cfg(best_cfg)  # apply permanently for rest of session
+    print(f"\n  Verifying on sample ({n_sample} days)...")
+    final = _fast_hod_lod(df, vix_series, sample, bin_size)
+    print(f"  HOD={final['hod_rate']:.1%}  LOD={final['lod_rate']:.1%}  "
+          f"Both={final['both_rate']:.1%}  "
+          f"avg_HOD={final['avg_hod_dist']:.1f}pts  avg_LOD={final['avg_lod_dist']:.1f}pts")
+    return best_cfg, final
+
+
+def full_coverage_date_range(df: pd.DataFrame, vix_series: pd.Series,
+                             start_date: str, end_date: str,
+                             tol_pct: float = 0.0012,
+                             bin_size: float = BIN_SIZE) -> dict:
+    """
+    HOD/LOD coverage on ALL eligible trading days in [start_date, end_date].
+    No sampling — every qualifying day is tested.
+    """
+    df2 = df.copy()
+    df2["_day"] = df2["date"].dt.date
+    day_stats   = df2.groupby("_day").agg(
+        bars=("close", "count"), hod=("high", "max"), lod=("low", "min"),
+    )
+    all_days  = sorted(day_stats.index.tolist())
+    start     = pd.Timestamp(start_date).date()
+    end       = pd.Timestamp(end_date).date()
+    eligible  = [d for d in all_days
+                 if start <= d <= end
+                 and day_stats.loc[d, "bars"] >= 300
+                 and all_days.index(d) >= 10]
+
+    print(f"  Full coverage: {start} → {end}  ({len(eligible)} eligible days)")
+    hod_hits = lod_hits = both_hits = total = 0
+    hod_dists: list[float] = []
+    lod_dists: list[float] = []
+
+    for i, day in enumerate(eligible):
+        df_prior  = df2[df2["_day"] < day]
+        df_window = df_prior.tail(30_000).copy()
+        if len(df_window) < 500:
+            continue
+        zones, _, _ = run(df_window, vix_series, bin_size=bin_size, quiet=True)
+        if not zones:
+            continue
+        zp      = np.array([z.price for z in zones])
+        hod     = float(day_stats.loc[day, "hod"])
+        lod     = float(day_stats.loc[day, "lod"])
+        tol     = ((hod + lod) / 2) * tol_pct
+        hd      = float(np.min(np.abs(zp - hod)))
+        ld      = float(np.min(np.abs(zp - lod)))
+        hod_hit = hd <= tol
+        lod_hit = ld <= tol
+        if hod_hit: hod_hits += 1
+        if lod_hit: lod_hits += 1
+        if hod_hit and lod_hit: both_hits += 1
+        total += 1
+        hod_dists.append(hd)
+        lod_dists.append(ld)
+
+        if (i + 1) % 50 == 0:
+            print(f"    [{i+1:>3}/{len(eligible)}]  {day}  "
+                  f"HOD={hod_hits}/{total}={hod_hits/total:.1%}  "
+                  f"LOD={lod_hits}/{total}={lod_hits/total:.1%}")
+
+    if total == 0:
+        print("  No days processed")
+        return {}
+
+    avg_hd = float(np.mean(hod_dists))
+    avg_ld = float(np.mean(lod_dists))
+    print(f"\n  ─── Results ({start} → {end}) ───")
+    print(f"  HOD: {hod_hits/total:.1%}  ({hod_hits}/{total})")
+    print(f"  LOD: {lod_hits/total:.1%}  ({lod_hits}/{total})")
+    print(f"  Both: {both_hits/total:.1%}  ({both_hits}/{total})")
+    print(f"  avg dist HOD={avg_hd:.1f}pts  LOD={avg_ld:.1f}pts")
+    return dict(hod_rate=hod_hits/total, lod_rate=lod_hits/total,
+                both_rate=both_hits/total, avg_hod_dist=avg_hd,
+                avg_lod_dist=avg_ld, n_days=total)
+
+
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="NQ 0DTE GEX Profile Analyzer")
-    parser.add_argument("--backtest",    action="store_true")
-    parser.add_argument("--hod-lod",     action="store_true")
-    parser.add_argument("--hod-days",    type=int, default=60)
-    parser.add_argument("--sample-days", type=int, default=0)
-    parser.add_argument("--seed",        type=int, default=None)
-    parser.add_argument("--top",         type=int, default=20)
-    parser.add_argument("--bins",        type=float, default=BIN_SIZE)
-    parser.add_argument("--rev-pct",     type=float, default=0.60)
-    parser.add_argument("--sessions",    type=int, default=N_SESSIONS,
+    parser.add_argument("--backtest",      action="store_true")
+    parser.add_argument("--hod-lod",       action="store_true")
+    parser.add_argument("--hod-days",      type=int, default=60)
+    parser.add_argument("--optimize",      action="store_true",
+                        help="Sweep params to maximise HOD/LOD coverage")
+    parser.add_argument("--opt-sample",    type=int, default=40,
+                        help="Days to sample per config during optimization")
+    parser.add_argument("--full-coverage", action="store_true",
+                        help="Run HOD/LOD on ALL days in --start / --end range")
+    parser.add_argument("--start",         type=str, default="2024-01-01")
+    parser.add_argument("--end",           type=str, default="2025-12-31")
+    parser.add_argument("--sample-days",   type=int, default=0)
+    parser.add_argument("--seed",          type=int, default=None)
+    parser.add_argument("--top",           type=int, default=20)
+    parser.add_argument("--bins",          type=float, default=BIN_SIZE)
+    parser.add_argument("--rev-pct",       type=float, default=0.60)
+    parser.add_argument("--sessions",      type=int, default=N_SESSIONS,
                         help=f"Prior sessions to stack (default {N_SESSIONS})")
-    parser.add_argument("--daily",       type=int, default=5)
+    parser.add_argument("--daily",         type=int, default=5)
     args = parser.parse_args()
 
     print("=" * 56)
@@ -1158,6 +1394,20 @@ def main():
     df         = load_nq_data()
     vix_series = load_vix()
     print(f"  NQ: {len(df):,} bars  {df['date'].min().date()} → {df['date'].max().date()}")
+
+    if args.optimize:
+        print(f"\nRunning GEX parameter optimization ({args.opt_sample} sample days)...")
+        seed = args.seed if args.seed is not None else 42
+        best_cfg, final = optimize_gex(df, vix_series, n_sample=args.opt_sample,
+                                       seed=seed, bin_size=args.bins)
+        return
+
+    if args.full_coverage:
+        print(f"\nFull HOD/LOD coverage: {args.start} → {args.end}")
+        full_coverage_date_range(df, vix_series,
+                                 start_date=args.start, end_date=args.end,
+                                 bin_size=args.bins)
+        return
 
     if args.hod_lod:
         print(f"\nRunning 0DTE HOD/LOD coverage ({args.hod_days} days)...")
